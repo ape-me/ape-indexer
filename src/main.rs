@@ -1,4 +1,4 @@
-mod borsh; mod events; mod tx; mod stocks;
+mod borsh; mod events; mod tx; mod stocks; mod store; mod stream; mod enrich;
 #[macro_use] mod decode;
 
 use anyhow::Result;
@@ -15,6 +15,12 @@ enum Cmd {
     DecodeFiles { #[arg(long)] stocks: String, files: Vec<String> },
     /// Sync the stock list from StonkFun and refresh USD prices once (or loop with --watch)
     Stocks { #[arg(long)] watch: bool },
+    /// Run the live indexer: Kaldera stream -> decode -> Postgres -> Redis
+    Stream,
+    /// Run one enrichment pass (supply, metadata, image) for tokens missing them
+    Enrich,
+    /// Print the Metaplex metadata PDA for a mint (self-check of the derivation)
+    Pda { mint: String },
 }
 
 #[tokio::main]
@@ -37,6 +43,21 @@ async fn main() -> Result<()> {
             println!("stocks={} priced={}", mints.len(), n);
             if watch { stocks::price_loop(db).await; }
         }
+        Cmd::Stream => {
+            let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+            stocks::sync_list(&db).await?;
+            stocks::refresh_prices(&db).await?;
+            tokio::spawn(stocks::price_loop(db.clone()));
+            tokio::spawn(enrich::run(db.clone()));
+            let store = store::Store::open(db, std::env::var("REDIS_URL").ok().as_deref()).await?;
+            stream::run(store).await?;
+        }
+        Cmd::Enrich => {
+            let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+            let n = enrich::pass(&db, &enrich::Rpc::new(), &reqwest::Client::new(), 200).await?;
+            println!("enriched {n}");
+        }
+        Cmd::Pda { mint } => println!("{}", enrich::metadata_pda(&mint)?),
     }
     Ok(())
 }

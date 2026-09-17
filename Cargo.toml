@@ -22,4 +22,6 @@ yellowstone-grpc-client = "8"
 yellowstone-grpc-proto = "8"
 futures = "0.3"
 base64 = "0.22"
+num-bigint = "0.4"
+num-traits = "0.2"
 clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,166 @@
+//! Applies events to Postgres, folds candles, keeps token_stats current, publishes trades on Redis.
+use crate::events::{Event, Program, Side};
+use anyhow::Result;
+use bigdecimal::BigDecimal;
+use redis::AsyncCommands;
+use serde::Serialize;
+use sqlx::PgPool;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+
+#[derive(Clone, Debug)]
+pub struct TokenInfo { pub decimals: i16, pub quote_mint: String, pub supply: Option<f64> }
+
+pub struct Store {
+    pub db: PgPool,
+    redis: Option<redis::aio::MultiplexedConnection>,
+    pub stocks: HashMap<String, i16>,          // mint -> decimals
+    stock_usd: HashMap<String, f64>,
+    tokens: HashMap<String, TokenInfo>,        // token mint -> info
+    pools: HashMap<String, String>,            // pool -> token mint
+}
+
+#[derive(Serialize)]
+pub struct TradeMsg<'a> { pub token_mint: &'a str, pub pool: &'a str, pub signature: &'a str, pub slot: u64, pub block_time: i64, pub wallet: &'a str, pub side: Side, pub base: f64, pub quote: f64, pub price_quote: f64, pub price_usd: Option<f64>, pub program: Program }
+
+impl Store {
+    pub async fn open(db: PgPool, redis_url: Option<&str>) -> Result<Store> {
+        let redis = match redis_url { Some(u) => Some(redis::Client::open(u)?.get_multiplexed_async_connection().await?), None => None };
+        let mut s = Store { db, redis, stocks: HashMap::new(), stock_usd: HashMap::new(), tokens: HashMap::new(), pools: HashMap::new() };
+        s.reload().await?;
+        Ok(s)
+    }
+
+    /// Load dictionaries from Postgres. Cheap; called at start and every minute.
+    pub async fn reload(&mut self) -> Result<()> {
+        let rows: Vec<(String, i16, Option<f64>)> = sqlx::query_as("SELECT mint, decimals, price_usd FROM stocks").fetch_all(&self.db).await?;
+        self.stocks = rows.iter().map(|r| (r.0.clone(), r.1)).collect();
+        self.stock_usd = rows.iter().filter_map(|r| r.2.map(|p| (r.0.clone(), p))).collect();
+        let toks: Vec<(String, i16, String, Option<BigDecimal>)> = sqlx::query_as("SELECT mint, decimals, quote_mint, supply FROM tokens").fetch_all(&self.db).await?;
+        self.tokens = toks.into_iter().map(|t| (t.0, TokenInfo { decimals: t.1, quote_mint: t.2, supply: t.3.and_then(|b| f64::from_str(&b.to_string()).ok()) })).collect();
+        let pools: Vec<(String, String)> = sqlx::query_as("SELECT pool, token_mint FROM pools").fetch_all(&self.db).await?;
+        self.pools = pools.into_iter().collect();
+        Ok(())
+    }
+
+    pub fn stock_set(&self) -> HashSet<String> { self.stocks.keys().cloned().collect() }
+
+    pub async fn apply(&mut self, ev: &Event) -> Result<bool> {
+        match ev {
+            Event::PoolCreated { meta, pool, base_mint, quote_mint, creator, base_vault, quote_vault, token, holder_rewards: _ } => {
+                let kind = if meta.program.is_curve() { "curve" } else { "amm" };
+                if meta.program.is_curve() {
+                    let decimals = token.as_ref().and_then(|t| t.decimals).unwrap_or(6) as i16;
+                    let (name, symbol, uri) = token.as_ref().map(|t| (Some(t.name.trim_end_matches('\0').to_string()), Some(t.symbol.trim_end_matches('\0').to_string()), Some(t.uri.trim_end_matches('\0').to_string()))).unwrap_or((None, None, None));
+                    sqlx::query("INSERT INTO tokens (mint, symbol, name, uri, quote_mint, launchpad, creator, decimals, phase, curve_pool, created_at, source)
+                                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'curve',$9,$10,'stream') ON CONFLICT (mint) DO NOTHING")
+                        .bind(base_mint).bind(symbol).bind(name).bind(uri).bind(quote_mint).bind(meta.program.launchpad()).bind(creator).bind(decimals).bind(pool).bind(meta.block_time)
+                        .execute(&self.db).await?;
+                    sqlx::query("INSERT INTO token_stats (token_mint, updated_at) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(base_mint).bind(meta.block_time).execute(&self.db).await?;
+                    self.tokens.entry(base_mint.clone()).or_insert(TokenInfo { decimals, quote_mint: quote_mint.clone(), supply: None });
+                } else if self.tokens.contains_key(base_mint) {
+                    // graduation: an AMM pool for a token we know
+                    sqlx::query("UPDATE tokens SET phase='graduated', amm_pool=$2 WHERE mint=$1 AND amm_pool IS NULL").bind(base_mint).bind(pool).execute(&self.db).await?;
+                    sqlx::query("UPDATE pools SET migrated_to=$2 WHERE token_mint=$1 AND kind='curve' AND migrated_to IS NULL").bind(base_mint).bind(pool).execute(&self.db).await?;
+                } else {
+                    return Ok(false); // stock/SOL, stock/USDC and other pools we don't care about
+                }
+                sqlx::query("INSERT INTO pools (pool, token_mint, program, kind, base_vault, quote_vault, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (pool) DO NOTHING")
+                    .bind(pool).bind(base_mint).bind(meta.program.name()).bind(kind).bind(base_vault).bind(quote_vault).bind(meta.block_time).execute(&self.db).await?;
+                self.pools.insert(pool.clone(), base_mint.clone());
+                Ok(true)
+            }
+            Event::Swap { meta, pool, base_mint, quote_mint, wallet, side, base_raw, quote_raw, .. } => {
+                let info = match self.tokens.get(base_mint) {
+                    Some(i) => i.clone(),
+                    None if meta.program.is_curve() => {
+                        // trade on a curve we never saw created (started mid-life). Stub the token; enrich later.
+                        let info = TokenInfo { decimals: 6, quote_mint: quote_mint.clone(), supply: None };
+                        sqlx::query("INSERT INTO tokens (mint, quote_mint, launchpad, decimals, phase, curve_pool, created_at, source) VALUES ($1,$2,$3,6,'curve',$4,$5,'stub') ON CONFLICT (mint) DO NOTHING")
+                            .bind(base_mint).bind(quote_mint).bind(meta.program.launchpad()).bind(pool).bind(meta.block_time).execute(&self.db).await?;
+                        sqlx::query("INSERT INTO token_stats (token_mint, updated_at) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(base_mint).bind(meta.block_time).execute(&self.db).await?;
+                        self.tokens.insert(base_mint.clone(), info.clone());
+                        info
+                    }
+                    None => return Ok(false),
+                };
+                if !self.pools.contains_key(pool) {
+                    let kind = if meta.program.is_curve() { "curve" } else { "amm" };
+                    sqlx::query("INSERT INTO pools (pool, token_mint, program, kind, created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (pool) DO NOTHING")
+                        .bind(pool).bind(base_mint).bind(meta.program.name()).bind(kind).bind(meta.block_time).execute(&self.db).await?;
+                    if kind == "amm" { sqlx::query("UPDATE tokens SET phase='graduated', amm_pool=$2 WHERE mint=$1 AND amm_pool IS NULL").bind(base_mint).bind(pool).execute(&self.db).await?; }
+                    self.pools.insert(pool.clone(), base_mint.clone());
+                }
+                let qd = *self.stocks.get(quote_mint).unwrap_or(&6) as i32;
+                let bd = info.decimals as i32;
+                let scale = 10f64.powi(bd - qd);
+                let Some(raw_price) = ev.raw_price() else { return Ok(false) };
+                let price_quote = raw_price * scale;
+                let base = *base_raw as f64 / 10f64.powi(bd);
+                let quote = *quote_raw as f64 / 10f64.powi(qd);
+                let ins = sqlx::query("INSERT INTO trades (signature, ix_index, slot, block_time, pool, token_mint, wallet, side, base_raw, quote_raw, price_quote)
+                                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING")
+                    .bind(&meta.signature).bind(meta.ix_index as i16).bind(meta.slot as i64).bind(meta.block_time).bind(pool).bind(base_mint).bind(wallet)
+                    .bind(match side { Side::Buy => "buy", Side::Sell => "sell" }).bind(BigDecimal::from(*base_raw)).bind(BigDecimal::from(*quote_raw)).bind(price_quote)
+                    .execute(&self.db).await?;
+                if ins.rows_affected() == 0 { return Ok(false); } // replayed duplicate
+                let minute = meta.block_time - meta.block_time.rem_euclid(60);
+                sqlx::query("INSERT INTO candles_1m (token_mint, minute, o, h, l, c, vol_quote, n) VALUES ($1,$2,$3,$3,$3,$3,$4,1)
+                             ON CONFLICT (token_mint, minute) DO UPDATE SET h=GREATEST(candles_1m.h,$3), l=LEAST(candles_1m.l,$3), c=$3, vol_quote=candles_1m.vol_quote+$4, n=candles_1m.n+1")
+                    .bind(base_mint).bind(minute).bind(price_quote).bind(quote).execute(&self.db).await?;
+                let usd = self.stock_usd.get(quote_mint).copied();
+                let price_usd = usd.map(|u| price_quote * u);
+                let mcap = price_usd.and_then(|p| info.supply.map(|s| p * s / 10f64.powi(bd)));
+                sqlx::query("INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, last_trade_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5)
+                             ON CONFLICT (token_mint) DO UPDATE SET price_quote=$2, price_usd=$3, mcap_usd=COALESCE($4, token_stats.mcap_usd), last_trade_at=$5, updated_at=$5")
+                    .bind(base_mint).bind(price_quote).bind(price_usd).bind(mcap).bind(meta.block_time).execute(&self.db).await?;
+                if let Some(r) = self.redis.as_mut() {
+                    let msg = TradeMsg { token_mint: base_mint, pool, signature: &meta.signature, slot: meta.slot, block_time: meta.block_time, wallet, side: *side, base, quote, price_quote, price_usd, program: meta.program };
+                    let json = serde_json::to_string(&msg)?;
+                    let _: () = r.publish(format!("trades:{base_mint}"), &json).await.unwrap_or(());
+                    let _: () = r.publish("trades:all", &json).await.unwrap_or(());
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// 24h rollups for every token that traded recently. Runs once a minute.
+    pub async fn rollup(&self) -> Result<u64> {
+        let now = crate::stocks::chrono_now();
+        let r = sqlx::query(
+            "WITH w AS (
+               SELECT token_mint,
+                      SUM(quote_raw::float8) AS vol_q,
+                      COUNT(*) FILTER (WHERE side='buy') AS buys,
+                      COUNT(*) FILTER (WHERE side='sell') AS sells
+               FROM trades WHERE block_time > $1 - 86400 GROUP BY token_mint),
+             p24 AS (
+               SELECT DISTINCT ON (token_mint) token_mint, c AS price_then FROM candles_1m
+               WHERE minute <= $1 - 86400 ORDER BY token_mint, minute DESC)
+             UPDATE token_stats ts SET
+               vol_24h_usd = COALESCE(w.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
+               buys_24h = COALESCE(w.buys, 0), sells_24h = COALESCE(w.sells, 0),
+               change_24h = CASE WHEN p24.price_then > 0 THEN (ts.price_quote / p24.price_then - 1) * 100 END,
+               price_usd = ts.price_quote * s.price_usd,
+               mcap_usd = CASE WHEN t.supply IS NOT NULL THEN ts.price_quote * s.price_usd * t.supply::float8 / POWER(10, t.decimals) ELSE ts.mcap_usd END,
+               updated_at = $1
+             FROM tokens t JOIN stocks s ON s.mint = t.quote_mint
+             LEFT JOIN w ON w.token_mint = t.mint
+             LEFT JOIN p24 ON p24.token_mint = t.mint
+             WHERE ts.token_mint = t.mint AND (ts.last_trade_at > $1 - 90000 OR w.token_mint IS NOT NULL)")
+            .bind(now).execute(&self.db).await?;
+        Ok(r.rows_affected())
+    }
+
+    pub async fn save_cursor(&self, slot: u64, signature: Option<&str>) -> Result<()> {
+        sqlx::query("INSERT INTO cursor (program, last_slot, last_signature, updated_at) VALUES ('stream',$1,$2,$3)
+                     ON CONFLICT (program) DO UPDATE SET last_slot=$1, last_signature=$2, updated_at=$3")
+            .bind(slot as i64).bind(signature).bind(crate::stocks::chrono_now()).execute(&self.db).await?;
+        Ok(())
+    }
+    pub async fn load_cursor(&self) -> Result<Option<u64>> {
+        let r: Option<(i64,)> = sqlx::query_as("SELECT last_slot FROM cursor WHERE program='stream'").fetch_optional(&self.db).await?;
+        Ok(r.map(|x| x.0 as u64))
+    }
+}
