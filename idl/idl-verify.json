@@ -1,0 +1,99 @@
+{
+ "pumpfun": {
+  "program": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "tx_checked": 8,
+  "instructions_matched": {
+   "sell": 3,
+   "buy": 4,
+   "buy_exact_quote_in_v2": 1
+  },
+  "events_matched": {
+   "TradeEvent": 8
+  },
+  "unknown_instructions": 0,
+  "sample_sigs": [
+   "YpZWnoZ6gZnx5mhaDS5ogVNStSavWfTj2w5J4k5MjtEJbieLr61MyJXRBuyD7od1fLZFUFY7LK3qWM1e91rgi8B",
+   "2mYoRMwHSELy7HKdAyXTN3e1JXa4K2ESKymuKEEUe3D3FCMxQbwQzmPSBfjtrxCLkooc92qm767HK5TKN93fXSfU"
+  ]
+ },
+ "pumpswap": {
+  "program": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+  "tx_checked": 8,
+  "instructions_matched": {
+   "sell": 4,
+   "buy_exact_quote_in": 2
+  },
+  "events_matched": {
+   "SellEvent": 4,
+   "BuyEvent": 2
+  },
+  "unknown_instructions": 0,
+  "sample_sigs": [
+   "4fCvpKRy3qCK9Jw645QoM9U7NhKYT9qNbgBsxLEaa2GKEMZXTMXVHbYkNmjodxJAHLNe7mntnhhyXVvohfDmEH5H",
+   "4xqb9yffQvxKzavzkHfrTRzG7dqV1qYbK86nWLyFkbdanfW2QLfoMmpg1ChTeAv4uhqsJgUvceKwvLgmutGci8Fp"
+  ]
+ },
+ "launchlab": {
+  "program": "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+  "tx_checked": 8,
+  "instructions_matched": {
+   "sell_exact_in": 3,
+   "buy_exact_in": 5
+  },
+  "events_matched": {
+   "TradeEvent": 8
+  },
+  "unknown_instructions": 0,
+  "sample_sigs": [
+   "2XkMpW5BxD3FTDXuaHsmvUAVM73oLEGXCBEtikKxbzvrSGAZNewPwJWTgWvBYf9qQ6rJaX61phjDaCaLkTC7mgFz",
+   "KaRVUgm2gc2Uc8LjnRmdVawLAjVk64cTYYnDRNuEfqHXSJcmkDx8wwbjxCMsEq9s1svKroFuRckwNFXcosy7ed3"
+  ]
+ },
+ "cpmm": {
+  "program": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+  "tx_checked": 8,
+  "instructions_matched": {
+   "swap_base_input": 7
+  },
+  "events_matched": {},
+  "unknown_instructions": 0,
+  "sample_sigs": [
+   "5qcVXArNvdXgubFzCZZGJ8gnJ5uunLRGMueA67XkDtJQ9NfszSpAJQkpc16MLu3Nn4vzRT4AZUDTYD6tYAxDA9ja",
+   "Q3iC4VyCVA2tcRaHsk7NhqJ8y4NuY61bEpZZfMWaQHxJrmu6okWNWnkQcS7r5HoPHUYwokmcLeuECk2sP8rTCx1"
+  ]
+ },
+ "dbc": {
+  "program": "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
+  "tx_checked": 8,
+  "instructions_matched": {
+   "swap2": 8
+  },
+  "events_matched": {
+   "EvtSwap": 8,
+   "EvtSwap2": 8
+  },
+  "unknown_instructions": 0,
+  "sample_sigs": [
+   "KV8V7BTpHjJkGMZxQBJbZqY7uLHxd5VJKX3PoKSMHuX8DS3WtjWzUPHhRdnnDYCofNKdg3bAkbdF9bfsjqWEcSa",
+   "2wDSh16xKNywp2JTzZpur8QwcHNVGNnH2PMNCjpa5W3xPp7FC6dmBMTxzg5Wj3w8JMEzcvfb8beBdUeHsVTEjhSZ"
+  ]
+ },
+ "damm2": {
+  "program": "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+  "tx_checked": 8,
+  "instructions_matched": {
+   "swap2": 2,
+   "swap": 2,
+   "claim_position_fee": 1
+  },
+  "events_matched": {
+   "EvtSwap2": 4,
+   "EvtClaimPositionFee": 1
+  },
+  "unknown_instructions": 0,
+  "sample_sigs": [
+   "5xdtrcYVv3g2c3VFqssjjF1mtUSNPwdKz35bhNS2cinjAxjioqnRcxs3NtTR9kxw77T3vQJU5D9Yta5SzeoHxJz",
+   "67TR5ys2nib3HbQANmWT3r9iuJ8KPsWftGbc7R3m7vWnQwr8sXVfoMXT9mSfPdrTp3RhsnB6V6FRccs2voqFYDaY"
+  ]
+ }
+}
