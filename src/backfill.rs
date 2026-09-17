@@ -151,10 +151,13 @@ pub async fn candles(db: &PgPool, limit_tokens: i64, max_per_pool: usize) -> Res
                 }
             }
             "pumpfun" => {
+                // pump.fun candles are in USD. Convert to the quote stock's units with its current USD price.
+                let usd: Option<f64> = sqlx::query_scalar("SELECT s.price_usd FROM tokens t JOIN stocks s ON s.mint=t.quote_mint WHERE t.mint=$1").bind(&mint).fetch_optional(db).await?.flatten();
+                let Some(usd) = usd.filter(|u| *u > 0.0) else { continue };
                 let url = format!("{PUMP_CANDLES}/{mint}/candles?interval=1m&limit={}", max_per_pool.min(1000));
                 if let Ok(v) = get(&c, &url).await {
                     for k in v.as_array().cloned().unwrap_or_default() {
-                        let f = |key: &str| k[key].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                        let f = |key: &str| k[key].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / usd;
                         put_candle(db, &mint, k["timestamp"].as_i64().unwrap_or(0) / 1000, f("open"), f("high"), f("low"), f("close"), f("volume")).await?;
                         got += 1;
                     }

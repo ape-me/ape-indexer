@@ -127,7 +127,12 @@ pub async fn pass(db: &PgPool, rpc: &Rpc, http: &reqwest::Client, limit: i64) ->
                         None => { sqlx::query("UPDATE tokens SET name='' WHERE mint=$1 AND name IS NULL").bind(&mint).execute(db).await?; }
                     }
                 }
-                Ok(None) => { tracing::warn!(mint, "mint account not found"); sqlx::query("UPDATE tokens SET name='' , supply=0 WHERE mint=$1 AND name IS NULL").bind(&mint).execute(db).await?; }
+                Ok(None) => {
+                    // the stream is a few hundred ms ahead of the RPC node: a brand-new mint may not be visible yet. Retry until it is 10 minutes old.
+                    let age: i64 = sqlx::query_scalar("SELECT $1 - created_at FROM tokens WHERE mint=$2").bind(crate::stocks::chrono_now()).bind(&mint).fetch_one(db).await.unwrap_or(0);
+                    if age > 600 { tracing::warn!(mint, age, "mint account not found, giving up"); sqlx::query("UPDATE tokens SET name=COALESCE(name,''), supply=COALESCE(supply,0) WHERE mint=$1").bind(&mint).execute(db).await?; }
+                    else { tracing::debug!(mint, age, "mint not visible on rpc yet"); }
+                }
                 Err(e) => tracing::warn!(%e, mint, "mint info"),
             }
         }
