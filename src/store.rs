@@ -13,6 +13,7 @@ pub struct TokenInfo { pub decimals: i16, pub quote_mint: String, pub supply: Op
 
 pub struct Store {
     pub db: PgPool,
+    rpc: crate::enrich::Rpc,
     redis: Option<redis::aio::MultiplexedConnection>,
     pub stocks: HashMap<String, i16>,          // mint -> decimals
     stock_usd: HashMap<String, f64>,
@@ -26,7 +27,7 @@ pub struct TradeMsg<'a> { pub token_mint: &'a str, pub pool: &'a str, pub signat
 impl Store {
     pub async fn open(db: PgPool, redis_url: Option<&str>) -> Result<Store> {
         let redis = match redis_url { Some(u) => Some(redis::Client::open(u)?.get_multiplexed_async_connection().await?), None => None };
-        let mut s = Store { db, redis, stocks: HashMap::new(), stock_usd: HashMap::new(), tokens: HashMap::new(), pools: HashMap::new() };
+        let mut s = Store { db, redis, rpc: crate::enrich::Rpc::new(), stocks: HashMap::new(), stock_usd: HashMap::new(), tokens: HashMap::new(), pools: HashMap::new() };
         s.reload().await?;
         Ok(s)
     }
@@ -75,9 +76,12 @@ impl Store {
                     Some(i) => i.clone(),
                     None if meta.program.is_curve() => {
                         // trade on a curve we never saw created (started mid-life). Stub the token; enrich later.
-                        let info = TokenInfo { decimals: 6, quote_mint: quote_mint.clone(), supply: None };
-                        sqlx::query("INSERT INTO tokens (mint, quote_mint, launchpad, decimals, phase, curve_pool, created_at, source) VALUES ($1,$2,$3,6,'curve',$4,$5,'stub') ON CONFLICT (mint) DO NOTHING")
-                            .bind(base_mint).bind(quote_mint).bind(meta.program.launchpad()).bind(pool).bind(meta.block_time).execute(&self.db).await?;
+                        let mi = self.rpc.mint_info(base_mint).await.ok().flatten();
+                        let decimals = mi.as_ref().map(|m| m.decimals).unwrap_or(6);
+                        let supply = mi.as_ref().and_then(|m| f64::from_str(&m.supply).ok());
+                        let info = TokenInfo { decimals, quote_mint: quote_mint.clone(), supply };
+                        sqlx::query("INSERT INTO tokens (mint, quote_mint, launchpad, decimals, supply, phase, curve_pool, created_at, source) VALUES ($1,$2,$3,$4,$5,'curve',$6,$7,'stub') ON CONFLICT (mint) DO NOTHING")
+                            .bind(base_mint).bind(quote_mint).bind(meta.program.launchpad()).bind(decimals).bind(mi.as_ref().and_then(|m| BigDecimal::from_str(&m.supply).ok())).bind(pool).bind(meta.block_time).execute(&self.db).await?;
                         sqlx::query("INSERT INTO token_stats (token_mint, updated_at) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(base_mint).bind(meta.block_time).execute(&self.db).await?;
                         self.tokens.insert(base_mint.clone(), info.clone());
                         info

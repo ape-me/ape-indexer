@@ -70,11 +70,11 @@ pub fn pair<P, E>(ctx: &Ctx, mut on_ix: impl FnMut(&Ix, u16) -> Option<P>, mut o
     let pid = ctx.program.id();
     let mut pending: Vec<P> = Vec::new();
     let mut out = Vec::new();
-    for ix in &ctx.tx.ixs {
+    for (i, ix) in ctx.tx.ixs.iter().enumerate() {
         if ix.program != pid { continue; }
         if event_disc(ix).is_some() {
-            if let Some(p) = pending.pop() { if let Some(e) = on_event(&p, ix, ix.outer) { out.push(e); } }
-        } else if let Some(p) = on_ix(ix, ix.outer) { pending.push(p); }
+            if let Some(p) = pending.pop() { if let Some(e) = on_event(&p, ix, i as u16) { out.push(e); } }
+        } else if let Some(p) = on_ix(ix, i as u16) { pending.push(p); }
     }
     out
 }

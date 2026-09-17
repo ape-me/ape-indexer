@@ -44,6 +44,10 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
     let (mut sink, mut stream) = client.subscribe_with_request(Some(request(stocks, from_slot))).await.context("subscribe")?;
     tracing::info!(from_slot, "subscribed");
     let mut last_slot: Option<u64> = None; let mut last_sig: Option<String> = None;
+    let rpc = crate::enrich::Rpc::new();
+    let mut block_times: HashMap<u64, i64> = HashMap::new();
+    let mut n_stocks = store.stocks.len();
+    let mut last_stock_check = Instant::now();
     let mut last_cursor = Instant::now(); let mut last_reload = Instant::now(); let mut last_rollup = Instant::now();
     let mut n_tx = 0u64; let mut n_ev = 0u64; let mut last_log = Instant::now();
     while let Some(msg) = stream.next().await {
@@ -52,10 +56,24 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
         match msg.update_oneof {
             Some(UpdateOneof::Transaction(tx)) => {
                 n_tx += 1;
-                let view = match TxView::from_geyser(&tx, created) { Ok(v) => v, Err(e) => { tracing::warn!(%e, "tx view"); continue } };
+                // real block time, one RPC call per new slot; falls back to receive time
+                let bt = match block_times.get(&tx.slot) {
+                    Some(t) => *t,
+                    None => {
+                        let t = rpc.call("getBlockTime", serde_json::json!([tx.slot])).await.ok().and_then(|v| v.as_i64()).unwrap_or(created);
+                        if block_times.len() > 4096 { block_times.clear(); }
+                        block_times.insert(tx.slot, t); t
+                    }
+                };
+                let view = match TxView::from_geyser(&tx, bt) { Ok(v) => v, Err(e) => { tracing::warn!(%e, "tx view"); continue } };
                 let stocks = store.stock_set();
                 for ev in decode::decode(&view, &stocks) {
-                    match store.apply(&ev).await { Ok(true) => n_ev += 1, Ok(false) => {}, Err(e) => tracing::error!(%e, sig = %view.signature, "apply") }
+                    match store.apply(&ev).await {
+                        Ok(true) => n_ev += 1,
+                        Ok(false) => {}
+                        // a failed write must not be skipped: drop the connection and replay from the last saved cursor
+                        Err(e) => { tracing::error!(%e, sig = %view.signature, "apply failed, replaying from cursor"); anyhow::bail!("apply: {e}"); }
+                    }
                 }
                 last_slot = Some(tx.slot); last_sig = Some(view.signature);
             }
@@ -64,6 +82,12 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
         }
         if last_cursor.elapsed() > Duration::from_secs(5) { if let Some(s) = last_slot { store.save_cursor(s, last_sig.as_deref()).await.ok(); } last_cursor = Instant::now(); }
         if last_reload.elapsed() > Duration::from_secs(60) { store.reload().await.ok(); last_reload = Instant::now(); }
+        if last_stock_check.elapsed() > Duration::from_secs(600) {
+            last_stock_check = Instant::now();
+            if let Ok(set) = crate::stocks::sync_list(&store.db).await { let _ = store.reload().await;
+                if set.len() != n_stocks { n_stocks = set.len(); tracing::info!(n = n_stocks, "stock list changed, resubscribing"); sink.send(request(set.into_iter().collect(), None)).await.ok(); }
+            }
+        }
         if last_rollup.elapsed() > Duration::from_secs(60) { match store.rollup().await { Ok(n) => tracing::debug!(n, "rollup"), Err(e) => tracing::warn!(%e, "rollup") } last_rollup = Instant::now(); }
         if last_log.elapsed() > Duration::from_secs(30) { tracing::info!(n_tx, n_ev, slot = last_slot, "stream"); n_tx = 0; n_ev = 0; last_log = Instant::now(); }
     }

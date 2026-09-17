@@ -1,0 +1,16 @@
+[Unit]
+Description=ApeMe indexer (Kaldera stream -> Postgres -> Redis)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/ape-indexer
+EnvironmentFile=/root/ape-indexer/.env
+Environment=RUST_LOG=info,sqlx=warn
+ExecStart=/root/ape-indexer/target/release/ape-indexer stream
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

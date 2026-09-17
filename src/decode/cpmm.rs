@@ -40,7 +40,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
         }
     }
     let mut li = 0usize;
-    for ix in &ctx.tx.ixs {
+    for (i, ix) in ctx.tx.ixs.iter().enumerate() {
         if ix.program != pid { continue; }
         let Some(d) = disc(ix) else { continue };
         let a = &ix.accounts;
@@ -48,7 +48,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
             INITIALIZE if a.len() > 11 => {
                 let Some((base, quote)) = orient(&a[4], &a[5], ctx.stocks) else { continue };
                 let (bv, qv) = if base == a[4] { (a[10].clone(), a[11].clone()) } else { (a[11].clone(), a[10].clone()) };
-                out.push(Event::PoolCreated { meta: ctx.meta(ix.outer), pool: a[3].clone(), base_mint: base, quote_mint: quote, creator: a[0].clone(), base_vault: Some(bv), quote_vault: Some(qv), token: None, holder_rewards: false });
+                out.push(Event::PoolCreated { meta: ctx.meta(i as u16), pool: a[3].clone(), base_mint: base, quote_mint: quote, creator: a[0].clone(), base_vault: Some(bv), quote_vault: Some(qv), token: None, holder_rewards: false });
             }
             SWAP_BASE_INPUT | SWAP_BASE_OUTPUT if a.len() > 11 => {
                 let Some(l) = logs.get(li) else { continue }; li += 1;
@@ -59,7 +59,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                 } else {
                     (Side::Sell, l.in_amt, l.out_amt - l.out_fee, in_after, out_after)
                 };
-                out.push(Event::Swap { meta: ctx.meta(ix.outer), pool: l.pool.clone(), base_mint: base, quote_mint: quote, wallet: a[0].clone(), side,
+                out.push(Event::Swap { meta: ctx.meta(i as u16), pool: l.pool.clone(), base_mint: base, quote_mint: quote, wallet: a[0].clone(), side,
                     base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: Some(rb as u128), reserve_quote_raw: Some(rq as u128), sqrt_price_q64: None });
             }
             _ => {}
