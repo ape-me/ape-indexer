@@ -1,4 +1,4 @@
-mod borsh; mod events; mod tx; mod stocks; mod store; mod stream; mod enrich;
+mod borsh; mod events; mod tx; mod stocks; mod store; mod stream; mod enrich; mod backfill;
 #[macro_use] mod decode;
 
 use anyhow::Result;
@@ -21,6 +21,8 @@ enum Cmd {
     Enrich,
     /// Print the Metaplex metadata PDA for a mint (self-check of the derivation)
     Pda { mint: String },
+    /// Backfill the catalog from Raydium, pump.fun and DexScreener, then candle history
+    Backfill { #[arg(long, default_value_t = 200)] ray_pages: usize, #[arg(long, default_value_t = 40)] pump_pages: usize, #[arg(long, default_value_t = 400)] candle_tokens: i64 },
 }
 
 #[tokio::main]
@@ -58,6 +60,15 @@ async fn main() -> Result<()> {
             println!("enriched {n}");
         }
         Cmd::Pda { mint } => println!("{}", enrich::metadata_pda(&mint)?),
+        Cmd::Backfill { ray_pages, pump_pages, candle_tokens } => {
+            let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+            stocks::sync_list(&db).await?;
+            let a = backfill::raydium(&db, ray_pages).await.unwrap_or_else(|e| { tracing::error!(%e, "raydium"); 0 });
+            let b = backfill::pump(&db, pump_pages).await.unwrap_or_else(|e| { tracing::error!(%e, "pump"); 0 });
+            let c = backfill::dbc(&db).await.unwrap_or_else(|e| { tracing::error!(%e, "dbc"); 0 });
+            let d = backfill::candles(&db, candle_tokens, 3000).await.unwrap_or_else(|e| { tracing::error!(%e, "candles"); 0 });
+            println!("raydium={a} pump={b} dbc={c} candles_for={d}");
+        }
     }
     Ok(())
 }
