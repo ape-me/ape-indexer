@@ -140,7 +140,7 @@ pub async fn candles(db: &PgPool, limit_tokens: i64, max_per_pool: usize) -> Res
             "stonkfun" => {
                 let mut next: Option<String> = None;
                 while got < max_per_pool {
-                    let url = format!("{RAY_KLINE}?poolId={pool}&interval=1m&limit=1000{}", next.as_ref().map(|k| format!("&nextPageKey={k}")).unwrap_or_default());
+                    let url = format!("{RAY_KLINE}?poolId={pool}&interval=1m&limit=100{}", next.as_ref().map(|k| format!("&nextPageKey={k}")).unwrap_or_default());
                     let Ok(v) = get(&c, &url).await else { break };
                     let rows = v["data"]["rows"].as_array().cloned().unwrap_or_default();
                     if rows.is_empty() { break; }
@@ -151,7 +151,7 @@ pub async fn candles(db: &PgPool, limit_tokens: i64, max_per_pool: usize) -> Res
                 }
             }
             "pumpfun" => {
-                let url = format!("{PUMP_CANDLES}/{mint}/candles?interval=1m&limit={max_per_pool}");
+                let url = format!("{PUMP_CANDLES}/{mint}/candles?interval=1m&limit={}", max_per_pool.min(1000));
                 if let Ok(v) = get(&c, &url).await {
                     for k in v.as_array().cloned().unwrap_or_default() {
                         let f = |key: &str| k[key].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);

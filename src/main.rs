@@ -23,6 +23,8 @@ enum Cmd {
     Pda { mint: String },
     /// Backfill the catalog from Raydium, pump.fun and DexScreener, then candle history
     Backfill { #[arg(long, default_value_t = 200)] ray_pages: usize, #[arg(long, default_value_t = 40)] pump_pages: usize, #[arg(long, default_value_t = 400)] candle_tokens: i64 },
+    /// Candle history only, for tokens that have none yet
+    Candles { #[arg(long, default_value_t = 600)] tokens: i64, #[arg(long, default_value_t = 1500)] max_per_pool: usize },
 }
 
 #[tokio::main]
@@ -68,6 +70,11 @@ async fn main() -> Result<()> {
             let c = backfill::dbc(&db).await.unwrap_or_else(|e| { tracing::error!(%e, "dbc"); 0 });
             let d = backfill::candles(&db, candle_tokens, 3000).await.unwrap_or_else(|e| { tracing::error!(%e, "candles"); 0 });
             println!("raydium={a} pump={b} dbc={c} candles_for={d}");
+        }
+        Cmd::Candles { tokens, max_per_pool } => {
+            let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+            let d = backfill::candles(&db, tokens, max_per_pool).await?;
+            println!("candles_for={d}");
         }
     }
     Ok(())
