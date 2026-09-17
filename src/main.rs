@@ -1,4 +1,4 @@
-mod borsh; mod events; mod tx;
+mod borsh; mod events; mod tx; mod stocks;
 #[macro_use] mod decode;
 
 use anyhow::Result;
@@ -13,9 +13,12 @@ struct Cli { #[command(subcommand)] cmd: Cmd }
 enum Cmd {
     /// Decode RPC-json transactions from files and print events as JSON lines
     DecodeFiles { #[arg(long)] stocks: String, files: Vec<String> },
+    /// Sync the stock list from StonkFun and refresh USD prices once (or loop with --watch)
+    Stocks { #[arg(long)] watch: bool },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let _ = dotenvy::from_path("/root/ape-indexer/.env");
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
     match Cli::parse().cmd {
@@ -26,6 +29,13 @@ fn main() -> Result<()> {
                 let view = tx::TxView::from_rpc_json(&v)?;
                 for ev in decode::decode(&view, &stocks) { println!("{}", serde_json::to_string(&ev)?); }
             }
+        }
+        Cmd::Stocks { watch } => {
+            let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+            let mints = stocks::sync_list(&db).await?;
+            let n = stocks::refresh_prices(&db).await?;
+            println!("stocks={} priced={}", mints.len(), n);
+            if watch { stocks::price_loop(db).await; }
         }
     }
     Ok(())
