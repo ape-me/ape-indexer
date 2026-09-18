@@ -45,7 +45,13 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                 Some(Event::Swap { meta: ctx.meta(ix_index), pool: pool.clone(), base_mint: base.clone(), quote_mint: quote.clone(), wallet: payer.clone(), side,
                     base_raw: base_raw as u128, quote_raw: quote_raw as u128,
                     reserve_base_raw: Some((virtual_base - real_base_after) as u128), reserve_quote_raw: Some((virtual_quote + real_quote_after) as u128), sqrt_price_q64: None,
-                    progress_pct: if total_base_sell > 0 { Some((real_base_after as f64 / total_base_sell as f64 * 100.0).clamp(0.0, 100.0)) } else { None } })
+                    progress_pct: {
+                        // Raydium's finishingRate = quote raised / quote at completion. On a constant-product curve the
+                        // quote at completion is vb*vq/(vb-T) - vq, where T = total base for sale; all in the event.
+                        let (vb, vq, t) = (virtual_base as f64, virtual_quote as f64, total_base_sell as f64);
+                        let q_final = if vb > t && t > 0.0 { vb * vq / (vb - t) - vq } else { 0.0 };
+                        if q_final > 0.0 { Some((real_quote_after as f64 / q_final * 100.0).clamp(0.0, 100.0)) } else { None }
+                    } })
             }
             _ => None,
         }

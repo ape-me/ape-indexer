@@ -19,6 +19,9 @@ pub struct Store {
     pools: HashMap<String, String>,            // pool -> token mint
 }
 
+fn symbol_c(t: &Option<crate::events::TokenMeta>) -> Option<String> { t.as_ref().map(|t| t.symbol.trim_end_matches('\0').trim().to_string()) }
+fn name_c(t: &Option<crate::events::TokenMeta>) -> Option<String> { t.as_ref().map(|t| t.name.trim_end_matches('\0').trim().to_string()) }
+
 impl Store {
     /// `push` = (ingest url, hmac secret) of ape-be; None disables live fan-out.
     pub async fn open(db: PgPool, push: Option<(String, String)>) -> Result<Store> {
@@ -55,10 +58,17 @@ impl Store {
                         .execute(&self.db).await?;
                     sqlx::query("INSERT INTO token_stats (token_mint, updated_at) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(base_mint).bind(meta.block_time).execute(&self.db).await?;
                     self.tokens.entry(base_mint.clone()).or_insert(TokenInfo { decimals, quote_mint: quote_mint.clone(), supply: None });
+                    if let Some(p) = &self.push {
+                        p.send_token(crate::push::IngestToken { event: "created", mint: base_mint.clone(), symbol: symbol_c(token), name: name_c(token), quote_mint: quote_mint.clone(), launchpad: meta.program.launchpad(), creator: Some(creator.clone()), created_at: meta.block_time, ts: meta.block_time });
+                    }
                 } else if self.tokens.contains_key(base_mint) {
                     // graduation: an AMM pool for a token we know
                     sqlx::query("UPDATE tokens SET phase='graduated', amm_pool=$2 WHERE mint=$1 AND amm_pool IS NULL").bind(base_mint).bind(pool).execute(&self.db).await?;
                     sqlx::query("UPDATE pools SET migrated_to=$2 WHERE token_mint=$1 AND kind='curve' AND migrated_to IS NULL").bind(base_mint).bind(pool).execute(&self.db).await?;
+                    if let Some(p) = &self.push {
+                        let qm = self.tokens.get(base_mint).map(|t| t.quote_mint.clone()).unwrap_or_else(|| quote_mint.clone());
+                        p.send_token(crate::push::IngestToken { event: "graduated", mint: base_mint.clone(), symbol: None, name: None, quote_mint: qm, launchpad: meta.program.launchpad(), creator: None, created_at: 0, ts: meta.block_time });
+                    }
                 } else {
                     return Ok(false); // stock/SOL, stock/USDC and other pools we don't care about
                 }
