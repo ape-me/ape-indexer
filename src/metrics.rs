@@ -11,6 +11,21 @@ pub fn install() {
         .install().expect("metrics exporter");
     tracing::info!(%addr, "metrics listening");
     describe();
+    zero();
+}
+
+/// Register every counter at 0 so panels show 0 instead of "No data" before the first event.
+fn zero() {
+    for r in ["ok", "failed", "dropped"] { counter!("ape_push_batches_total", "result" => r).absolute(0); }
+    for p in ["launchlab", "cpmm", "pumpfun", "pumpswap", "dbc", "damm2"] {
+        counter!("ape_trades_stored_total", "program" => p).absolute(0);
+        for k in ["swap", "pool"] { counter!("ape_events_total", "program" => p, "kind" => k).absolute(0); }
+    }
+    for n in ["ape_tx_total", "ape_trades_dup_total", "ape_reconnects_total", "ape_apply_errors_total", "ape_blocktime_extrapolated_total", "ape_push_trades_total", "ape_rpc_errors_total"] {
+        counter!(n).absolute(0);
+    }
+    gauge!("ape_pending_slots").set(0.0);
+    gauge!("ape_newest_trade_age_seconds").set(0.0);
 }
 
 fn describe() {
