@@ -1,5 +1,5 @@
 [Unit]
-Description=ApeMe indexer (Kaldera stream -> Postgres -> Redis)
+Description=ApeMe indexer (Kaldera stream -> Postgres -> ape-be)
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -11,6 +11,9 @@ ExecStart=/root/ape-indexer/target/release/ape-indexer stream
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
+Nice=-10
+CPUWeight=1000
+IOWeight=1000
 
 [Install]
 WantedBy=multi-user.target
