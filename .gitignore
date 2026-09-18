@@ -7,3 +7,5 @@ node_modules/
 # Added by cargo
 
 /target
+soak/soak.log
+soak/soak.out
