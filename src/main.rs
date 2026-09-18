@@ -1,4 +1,5 @@
-mod borsh; mod events; mod tx; mod stocks; mod store; mod stream; mod enrich; mod backfill;
+mod borsh; mod events; mod tx; mod stocks; mod push;
+mod store; mod stream; mod enrich; mod backfill;
 #[macro_use] mod decode;
 
 use anyhow::Result;
@@ -15,7 +16,7 @@ enum Cmd {
     DecodeFiles { #[arg(long)] stocks: String, files: Vec<String> },
     /// Sync the stock list from StonkFun and refresh USD prices once (or loop with --watch)
     Stocks { #[arg(long)] watch: bool },
-    /// Run the live indexer: Kaldera stream -> decode -> Postgres -> Redis
+    /// Run the live indexer: Kaldera stream -> decode -> Postgres -> ape-be push
     Stream,
     /// Run one enrichment pass (supply, metadata, image) for tokens missing them
     Enrich,
@@ -53,7 +54,8 @@ async fn main() -> Result<()> {
             stocks::refresh_prices(&db).await?;
             tokio::spawn(stocks::price_loop(db.clone()));
             tokio::spawn(enrich::run(db.clone()));
-            let store = store::Store::open(db, std::env::var("REDIS_URL").ok().as_deref()).await?;
+            let push = match (std::env::var("INGEST_URL"), std::env::var("INGEST_SECRET")) { (Ok(u), Ok(k)) => Some((u, k)), _ => { tracing::warn!("INGEST_URL/INGEST_SECRET unset: live push disabled"); None } };
+            let store = store::Store::open(db, push).await?;
             stream::run(store).await?;
         }
         Cmd::Enrich => {

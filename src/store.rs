@@ -1,9 +1,7 @@
-//! Applies events to Postgres, folds candles, keeps token_stats current, publishes trades on Redis.
-use crate::events::{Event, Program, Side};
+//! Applies events to Postgres, folds candles, keeps token_stats current, pushes trades to ape-be.
+use crate::events::{Event, Side};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
-use redis::AsyncCommands;
-use serde::Serialize;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -14,20 +12,18 @@ pub struct TokenInfo { pub decimals: i16, pub quote_mint: String, pub supply: Op
 pub struct Store {
     pub db: PgPool,
     rpc: crate::enrich::Rpc,
-    redis: Option<redis::aio::MultiplexedConnection>,
+    push: Option<crate::push::Pusher>,
     pub stocks: HashMap<String, i16>,          // mint -> decimals
     stock_usd: HashMap<String, f64>,
     tokens: HashMap<String, TokenInfo>,        // token mint -> info
     pools: HashMap<String, String>,            // pool -> token mint
 }
 
-#[derive(Serialize)]
-pub struct TradeMsg<'a> { pub token_mint: &'a str, pub pool: &'a str, pub signature: &'a str, pub slot: u64, pub block_time: i64, pub wallet: &'a str, pub side: Side, pub base: f64, pub quote: f64, pub price_quote: f64, pub price_usd: Option<f64>, pub program: Program }
-
 impl Store {
-    pub async fn open(db: PgPool, redis_url: Option<&str>) -> Result<Store> {
-        let redis = match redis_url { Some(u) => Some(redis::Client::open(u)?.get_multiplexed_async_connection().await?), None => None };
-        let mut s = Store { db, redis, rpc: crate::enrich::Rpc::new(), stocks: HashMap::new(), stock_usd: HashMap::new(), tokens: HashMap::new(), pools: HashMap::new() };
+    /// `push` = (ingest url, hmac secret) of ape-be; None disables live fan-out.
+    pub async fn open(db: PgPool, push: Option<(String, String)>) -> Result<Store> {
+        let push = push.map(|(u, k)| crate::push::Pusher::start(u, k));
+        let mut s = Store { db, push, rpc: crate::enrich::Rpc::new(), stocks: HashMap::new(), stock_usd: HashMap::new(), tokens: HashMap::new(), pools: HashMap::new() };
         s.reload().await?;
         Ok(s)
     }
@@ -118,11 +114,8 @@ impl Store {
                 sqlx::query("INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, last_trade_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5)
                              ON CONFLICT (token_mint) DO UPDATE SET price_quote=$2, price_usd=$3, mcap_usd=COALESCE($4, token_stats.mcap_usd), last_trade_at=$5, updated_at=$5")
                     .bind(base_mint).bind(price_quote).bind(price_usd).bind(mcap).bind(meta.block_time).execute(&self.db).await?;
-                if let Some(r) = self.redis.as_mut() {
-                    let msg = TradeMsg { token_mint: base_mint, pool, signature: &meta.signature, slot: meta.slot, block_time: meta.block_time, wallet, side: *side, base, quote, price_quote, price_usd, program: meta.program };
-                    let json = serde_json::to_string(&msg)?;
-                    let _: () = r.publish(format!("trades:{base_mint}"), &json).await.unwrap_or(());
-                    let _: () = r.publish("trades:all", &json).await.unwrap_or(());
+                if let Some(p) = &self.push {
+                    p.send(crate::push::IngestTrade { mint: base_mint.clone(), pool: pool.clone(), program: meta.program, sig: meta.signature.clone(), ts: meta.block_time, slot: meta.slot, side: *side, wallet: wallet.clone(), base, quote, price_quote, price_usd });
                 }
                 Ok(true)
             }
