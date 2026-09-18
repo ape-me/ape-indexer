@@ -48,7 +48,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                 // event reserves are pre-trade; custom pairs add virtual quote reserves to the curve
                 let rb = pool_base as u128 - base_out as u128; let rq = pool_quote as u128 + virtual_quote + quote_in as u128;
                 Some(Event::Swap { meta: ctx.meta(ix_index), pool, base_mint: base.clone(), quote_mint: quote.clone(), wallet: user, side: Side::Buy,
-                    base_raw: base_out as u128, quote_raw: quote_in as u128, reserve_base_raw: Some(rb), reserve_quote_raw: Some(rq), sqrt_price_q64: None })
+                    base_raw: base_out as u128, quote_raw: quote_in as u128, reserve_base_raw: Some(rb), reserve_quote_raw: Some(rq), sqrt_price_q64: None, progress_pct: None })
             }
             (P::Trade { base, quote }, EV_SELL) => {
                 if !ctx.is_stock(quote) { return None; }
@@ -61,7 +61,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                 let virtual_quote = r.i128().unwrap_or(0).max(0) as u128;
                 let rb = pool_base as u128 + base_in as u128; let rq = (pool_quote as u128 + virtual_quote).saturating_sub(quote_out as u128);
                 Some(Event::Swap { meta: ctx.meta(ix_index), pool, base_mint: base.clone(), quote_mint: quote.clone(), wallet: user, side: Side::Sell,
-                    base_raw: base_in as u128, quote_raw: quote_out as u128, reserve_base_raw: Some(rb), reserve_quote_raw: Some(rq), sqrt_price_q64: None })
+                    base_raw: base_in as u128, quote_raw: quote_out as u128, reserve_base_raw: Some(rb), reserve_quote_raw: Some(rq), sqrt_price_q64: None, progress_pct: None })
             }
             _ => None,
         }

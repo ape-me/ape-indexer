@@ -43,7 +43,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                 let (side, base_raw, quote_raw) = if quote_in { (Side::Buy, output, excl_in) } else { (Side::Sell, excl_in, output) };
                 let (rb, rq) = if a_is_base { (reserve_a, reserve_b) } else { (reserve_b, reserve_a) };
                 Some(Event::Swap { meta: ctx.meta(ix_index), pool: pool.clone(), base_mint: base, quote_mint: quote, wallet: payer.clone(), side,
-                    base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: Some(rb as u128), reserve_quote_raw: Some(rq as u128), sqrt_price_q64: None })
+                    base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: Some(rb as u128), reserve_quote_raw: Some(rq as u128), sqrt_price_q64: None, progress_pct: None })
             }
             _ => None,
         }

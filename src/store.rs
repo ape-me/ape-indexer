@@ -67,7 +67,7 @@ impl Store {
                 self.pools.insert(pool.clone(), base_mint.clone());
                 Ok(true)
             }
-            Event::Swap { meta, pool, base_mint, quote_mint, wallet, side, base_raw, quote_raw, .. } => {
+            Event::Swap { meta, pool, base_mint, quote_mint, wallet, side, base_raw, quote_raw, progress_pct, .. } => {
                 let info = match self.tokens.get(base_mint) {
                     Some(i) => i.clone(),
                     None if meta.program.is_curve() => {
@@ -112,15 +112,15 @@ impl Store {
                        SELECT $6, $12, $11, $11, $11, $11, $13, 1 WHERE EXISTS (SELECT 1 FROM t)
                        ON CONFLICT (token_mint, minute) DO UPDATE SET h=GREATEST(candles_1m.h,$11), l=LEAST(candles_1m.l,$11), c=$11, vol_quote=candles_1m.vol_quote+$13, n=candles_1m.n+1
                      ), s AS (
-                       INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, ath_mcap_usd, last_trade_at, updated_at)
-                       SELECT $6, $11, $14, $15, $15, $4, $4 WHERE EXISTS (SELECT 1 FROM t)
+                       INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, ath_mcap_usd, progress_pct, last_trade_at, updated_at)
+                       SELECT $6, $11, $14, $15, $15, $16, $4, $4 WHERE EXISTS (SELECT 1 FROM t)
                        ON CONFLICT (token_mint) DO UPDATE SET price_quote=$11, price_usd=$14, mcap_usd=COALESCE($15, token_stats.mcap_usd),
-                         ath_mcap_usd=GREATEST(COALESCE(token_stats.ath_mcap_usd, 0), COALESCE($15, 0)), last_trade_at=$4, updated_at=$4
+                         ath_mcap_usd=GREATEST(COALESCE(token_stats.ath_mcap_usd, 0), COALESCE($15, 0)), progress_pct=COALESCE($16, token_stats.progress_pct), last_trade_at=$4, updated_at=$4
                      )
                      SELECT count(*) FROM t")
                     .bind(&meta.signature).bind(meta.ix_index as i16).bind(meta.slot as i64).bind(meta.block_time).bind(pool).bind(base_mint).bind(wallet)
                     .bind(match side { Side::Buy => "buy", Side::Sell => "sell" }).bind(BigDecimal::from(*base_raw)).bind(BigDecimal::from(*quote_raw)).bind(price_quote)
-                    .bind(minute).bind(quote).bind(price_usd).bind(mcap)
+                    .bind(minute).bind(quote).bind(price_usd).bind(mcap).bind(*progress_pct)
                     .fetch_one(&self.db).await?;
                 if ins.0 == 0 { return Ok(false); } // replayed duplicate
                 if let Some(p) = &self.push {
@@ -206,7 +206,7 @@ impl Store {
                WHERE t.source = 'stream' AND t.supply IS NOT NULL AND t.supply > 0
                  AND ts.last_trade_at > $1 - 3600
                  AND (ts.holders_at IS NULL OR ts.holders_at < $1 - CASE WHEN ts.last_trade_at > $1 - 300 THEN 120 ELSE 600 END)
-               ORDER BY ts.holders_at NULLS FIRST LIMIT $2),
+               ORDER BY ts.holders_at NULLS FIRST, ts.last_trade_at DESC LIMIT $2),
              pos AS (
                SELECT tr.token_mint, tr.wallet,
                       SUM(CASE WHEN tr.side='buy' THEN tr.base_raw::float8 ELSE -tr.base_raw::float8 END) AS bal,

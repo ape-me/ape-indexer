@@ -64,7 +64,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                     (Side::Sell, paid, got, in_after, out_after)
                 };
                 out.push(Event::Swap { meta: ctx.meta(i as u16), pool: l.pool.clone(), base_mint: base, quote_mint: quote, wallet: a[0].clone(), side,
-                    base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: Some(rb as u128), reserve_quote_raw: Some(rq as u128), sqrt_price_q64: None });
+                    base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: Some(rb as u128), reserve_quote_raw: Some(rq as u128), sqrt_price_q64: None, progress_pct: None });
             }
             _ => {}
         }

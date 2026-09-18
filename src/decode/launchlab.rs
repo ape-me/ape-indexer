@@ -34,7 +34,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
             }
             (P::Trade { payer, pool, base, quote }, EV_TRADE) => {
                 if !ctx.is_stock(quote) { return None; }
-                let _pool = r.pubkey().ok()?; let _total_base_sell = r.u64().ok()?;
+                let _pool = r.pubkey().ok()?; let total_base_sell = r.u64().ok()?;
                 let virtual_base = r.u64().ok()?; let virtual_quote = r.u64().ok()?;
                 let _rb0 = r.u64().ok()?; let _rq0 = r.u64().ok()?;
                 let real_base_after = r.u64().ok()?; let real_quote_after = r.u64().ok()?;
@@ -44,7 +44,8 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                 let (side, base_raw, quote_raw) = if dir == 0 { (Side::Buy, amount_out, amount_in) } else { (Side::Sell, amount_in, amount_out) };
                 Some(Event::Swap { meta: ctx.meta(ix_index), pool: pool.clone(), base_mint: base.clone(), quote_mint: quote.clone(), wallet: payer.clone(), side,
                     base_raw: base_raw as u128, quote_raw: quote_raw as u128,
-                    reserve_base_raw: Some((virtual_base - real_base_after) as u128), reserve_quote_raw: Some((virtual_quote + real_quote_after) as u128), sqrt_price_q64: None })
+                    reserve_base_raw: Some((virtual_base - real_base_after) as u128), reserve_quote_raw: Some((virtual_quote + real_quote_after) as u128), sqrt_price_q64: None,
+                    progress_pct: if total_base_sell > 0 { Some((real_base_after as f64 / total_base_sell as f64 * 100.0).clamp(0.0, 100.0)) } else { None } })
             }
             _ => None,
         }

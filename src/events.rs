@@ -56,6 +56,8 @@ pub enum Event {
         base_raw: u128, quote_raw: u128,
         /// post-trade pool reserves in raw units when the program reports them. price = quote/base
         reserve_base_raw: Option<u128>, reserve_quote_raw: Option<u128>,
+        /// bonding-curve progress 0..100, curve programs only
+        progress_pct: Option<f64>,
         /// for DBC-style pools: sqrt price Q64.64, quote per base in raw units
         sqrt_price_q64: Option<u128>,
     },

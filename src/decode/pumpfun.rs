@@ -40,7 +40,7 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
             (P::Trade { bonding_curve }, EV_TRADE) => {
                 let mint = r.pubkey().ok()?; let _sol_amount = r.u64().ok()?; let token_amount = r.u64().ok()?; let is_buy = r.bool().ok()?;
                 let user = r.pubkey().ok()?; let _ts = r.i64().ok()?;
-                let _vsol = r.u64().ok()?; let virtual_token = r.u64().ok()?; let _rsol = r.u64().ok()?; let _rtok = r.u64().ok()?;
+                let _vsol = r.u64().ok()?; let virtual_token = r.u64().ok()?; let _rsol = r.u64().ok()?; let real_token = r.u64().ok()?;
                 let _fee_recipient = r.pubkey().ok()?; let _fbps = r.u64().ok()?; let _fee = r.u64().ok()?;
                 let _creator = r.pubkey().ok()?; let _cfbps = r.u64().ok()?; let _cfee = r.u64().ok()?;
                 let _track = r.bool().ok()?; r.skip(3 * 8).ok()?; let _lu = r.i64().ok()?; let _ix_name = r.string().ok()?;
@@ -51,7 +51,8 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
                 if !ctx.is_stock(&quote_mint) { return None; }
                 Some(Event::Swap { meta: ctx.meta(ix_index), pool: bonding_curve.clone(), base_mint: mint, quote_mint, wallet: user, side: if is_buy { Side::Buy } else { Side::Sell },
                     base_raw: token_amount as u128, quote_raw: quote_amount as u128,
-                    reserve_base_raw: Some(virtual_token as u128), reserve_quote_raw: Some(virtual_quote as u128), sqrt_price_q64: None })
+                    reserve_base_raw: Some(virtual_token as u128), reserve_quote_raw: Some(virtual_quote as u128), sqrt_price_q64: None,
+                    progress_pct: Some(((1.0 - real_token as f64 / 793_100_000_000_000.0) * 100.0).clamp(0.0, 100.0)) })
             }
             _ => None,
         }

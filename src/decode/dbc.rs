@@ -51,5 +51,5 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
 fn swap(ctx: &Ctx, ix_index: u16, pool: &str, base: &str, quote: &str, payer: &str, dir: u8, amount_in: u64, amount_out: u64, next_sqrt: u128) -> Event {
     let (side, base_raw, quote_raw) = if dir == 0 { (Side::Sell, amount_in, amount_out) } else { (Side::Buy, amount_out, amount_in) };
     Event::Swap { meta: ctx.meta(ix_index), pool: pool.into(), base_mint: base.into(), quote_mint: quote.into(), wallet: payer.into(), side,
-        base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: None, reserve_quote_raw: None, sqrt_price_q64: Some(next_sqrt) }
+        base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: None, reserve_quote_raw: None, sqrt_price_q64: Some(next_sqrt), progress_pct: None }
 }
