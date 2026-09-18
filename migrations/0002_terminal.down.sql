@@ -1,0 +1,3 @@
+ALTER TABLE token_stats DROP COLUMN vol_5m_usd, DROP COLUMN buys_5m, DROP COLUMN sells_5m, DROP COLUMN vol_1h_usd, DROP COLUMN buys_1h, DROP COLUMN sells_1h, DROP COLUMN change_1h, DROP COLUMN ath_mcap_usd, DROP COLUMN holders, DROP COLUMN top10_pct, DROP COLUMN dev_pct, DROP COLUMN snipers_pct, DROP COLUMN holders_at;
+ALTER TABLE tokens DROP COLUMN website, DROP COLUMN twitter, DROP COLUMN telegram, DROP COLUMN socials_at, DROP COLUMN dex_paid, DROP COLUMN dex_paid_at, DROP COLUMN dex_boosts, DROP COLUMN dex_checked_at;
+DROP INDEX IF EXISTS token_stats_vol_1h; DROP INDEX IF EXISTS token_stats_progress; DROP INDEX IF EXISTS tokens_phase_created; DROP INDEX IF EXISTS trades_token_wallet;

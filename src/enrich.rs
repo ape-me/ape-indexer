@@ -108,6 +108,50 @@ impl Rpc {
     }
 }
 
+/// website / twitter / telegram from a metadata JSON. pump.fun and LaunchLab put them at the top level;
+/// Metaplex-style files use `extensions` or `properties.links`; a bare `x`/`discord` key is tolerated.
+fn socials(j: &Value) -> (Option<String>, Option<String>, Option<String>) {
+    let pick = |keys: &[&str]| -> Option<String> {
+        for scope in [j, &j["extensions"], &j["properties"]["links"], &j["properties"]] {
+            for k in keys { if let Some(v) = scope[k].as_str() { let v = v.trim(); if v.starts_with("http") || v.starts_with('@') { return Some(v.chars().take(200).collect()); } } }
+        }
+        None
+    };
+    (pick(&["website", "external_url", "url"]), pick(&["twitter", "x"]), pick(&["telegram", "tg"]))
+}
+
+/// DexScreener paid status. 60 requests/minute allowed; one token per second, active tokens first, each rechecked
+/// every 30 minutes and new tokens within 2 minutes of birth.
+pub async fn dex_paid_loop(db: PgPool) {
+    let http = reqwest::Client::builder().user_agent("Mozilla/5.0 ape-indexer").timeout(Duration::from_secs(10)).build().unwrap();
+    loop {
+        let now = crate::stocks::chrono_now();
+        let next: Option<(String,)> = sqlx::query_as(
+            "SELECT t.mint FROM tokens t JOIN token_stats ts ON ts.token_mint = t.mint
+             WHERE ts.last_trade_at > $1 - 3600
+               AND (t.dex_checked_at IS NULL OR t.dex_checked_at < $1 - 1800)
+               AND t.created_at < $1 - 120
+             ORDER BY t.dex_checked_at NULLS FIRST, ts.vol_1h_usd DESC LIMIT 1").bind(now).fetch_optional(&db).await.unwrap_or(None);
+        let Some((mint,)) = next else { tokio::time::sleep(Duration::from_secs(5)).await; continue };
+        let url = format!("https://api.dexscreener.com/orders/v1/solana/{mint}");
+        match http.get(&url).send().await {
+            Ok(r) if r.status().is_success() => {
+                let j: Value = r.json().await.unwrap_or(Value::Null);
+                // live shape: {orders:[{type,status,paymentTimestamp}], boosts:[{amount,...}]}; docs shape: bare array of orders
+                let orders = j["orders"].as_array().cloned().or_else(|| j.as_array().cloned()).unwrap_or_default();
+                let paid = orders.iter().filter(|o| o["type"] == "tokenProfile" && o["status"] == "approved").filter_map(|o| o["paymentTimestamp"].as_i64()).max();
+                let boosts = j["boosts"].as_array().map(|b| b.iter().filter_map(|x| x["amount"].as_i64()).sum::<i64>()).unwrap_or(0);
+                let _ = sqlx::query("UPDATE tokens SET dex_paid=$2, dex_paid_at=$3, dex_boosts=$4, dex_checked_at=$5 WHERE mint=$1")
+                    .bind(&mint).bind(paid.is_some()).bind(paid.map(|t| t / 1000)).bind(boosts as i32).bind(now).execute(&db).await;
+            }
+            Ok(r) if r.status().as_u16() == 429 => { tracing::warn!("dexscreener 429, backing off"); tokio::time::sleep(Duration::from_secs(30)).await; }
+            Ok(r) => { tracing::debug!(status = %r.status(), mint, "dexscreener"); let _ = sqlx::query("UPDATE tokens SET dex_checked_at=$2 WHERE mint=$1").bind(&mint).bind(now).execute(&db).await; }
+            Err(e) => { tracing::warn!(%e, "dexscreener"); tokio::time::sleep(Duration::from_secs(5)).await; }
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
+}
+
 /// One pass: up to `limit` tokens missing supply or name. Returns how many were touched.
 pub async fn pass(db: &PgPool, rpc: &Rpc, http: &reqwest::Client, limit: i64) -> Result<usize> {
     let rows: Vec<(String, Option<String>, Option<String>, Option<BigDecimal>, Option<String>)> =
@@ -138,13 +182,25 @@ pub async fn pass(db: &PgPool, rpc: &Rpc, http: &reqwest::Client, limit: i64) ->
         }
         if image.is_none() {
             if let Some(u) = uri.filter(|u| u.starts_with("http")) {
-                let img = match http.get(&u).send().await.and_then(|r| r.error_for_status()) {
-                    Ok(r) => r.json::<Value>().await.ok().and_then(|j| j["image"].as_str().map(String::from)),
-                    Err(_) => None,
-                };
-                sqlx::query("UPDATE tokens SET image=$2 WHERE mint=$1").bind(&mint).bind(img.unwrap_or_default()).execute(db).await?;
+                let j = match http.get(&u).send().await.and_then(|r| r.error_for_status()) { Ok(r) => r.json::<Value>().await.ok(), Err(_) => None };
+                let img = j.as_ref().and_then(|j| j["image"].as_str().map(String::from));
+                let (web, tw, tg) = j.as_ref().map(socials).unwrap_or((None, None, None));
+                sqlx::query("UPDATE tokens SET image=$2, website=COALESCE($3, website), twitter=COALESCE($4, twitter), telegram=COALESCE($5, telegram), socials_at=$6 WHERE mint=$1")
+                    .bind(&mint).bind(img.unwrap_or_default()).bind(web).bind(tw).bind(tg).bind(crate::stocks::chrono_now()).execute(db).await?;
             }
         }
+        n += 1;
+    }
+    // tokens enriched before socials existed: read their metadata JSON once more, active ones first
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT t.mint, t.uri FROM tokens t JOIN token_stats ts ON ts.token_mint = t.mint
+         WHERE t.socials_at IS NULL AND t.image IS NOT NULL AND t.uri LIKE 'http%' AND ts.last_trade_at > $1 - 86400
+         ORDER BY ts.vol_1h_usd DESC LIMIT 10").bind(crate::stocks::chrono_now()).fetch_all(db).await?;
+    for (mint, u) in rows {
+        let j = match http.get(&u).send().await.and_then(|r| r.error_for_status()) { Ok(r) => r.json::<Value>().await.ok(), Err(_) => None };
+        let (web, tw, tg) = j.as_ref().map(socials).unwrap_or((None, None, None));
+        sqlx::query("UPDATE tokens SET website=$2, twitter=$3, telegram=$4, socials_at=$5 WHERE mint=$1")
+            .bind(&mint).bind(web).bind(tw).bind(tg).bind(crate::stocks::chrono_now()).execute(db).await?;
         n += 1;
     }
     Ok(n)

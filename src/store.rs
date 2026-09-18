@@ -112,9 +112,10 @@ impl Store {
                        SELECT $6, $12, $11, $11, $11, $11, $13, 1 WHERE EXISTS (SELECT 1 FROM t)
                        ON CONFLICT (token_mint, minute) DO UPDATE SET h=GREATEST(candles_1m.h,$11), l=LEAST(candles_1m.l,$11), c=$11, vol_quote=candles_1m.vol_quote+$13, n=candles_1m.n+1
                      ), s AS (
-                       INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, last_trade_at, updated_at)
-                       SELECT $6, $11, $14, $15, $4, $4 WHERE EXISTS (SELECT 1 FROM t)
-                       ON CONFLICT (token_mint) DO UPDATE SET price_quote=$11, price_usd=$14, mcap_usd=COALESCE($15, token_stats.mcap_usd), last_trade_at=$4, updated_at=$4
+                       INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, ath_mcap_usd, last_trade_at, updated_at)
+                       SELECT $6, $11, $14, $15, $15, $4, $4 WHERE EXISTS (SELECT 1 FROM t)
+                       ON CONFLICT (token_mint) DO UPDATE SET price_quote=$11, price_usd=$14, mcap_usd=COALESCE($15, token_stats.mcap_usd),
+                         ath_mcap_usd=GREATEST(COALESCE(token_stats.ath_mcap_usd, 0), COALESCE($15, 0)), last_trade_at=$4, updated_at=$4
                      )
                      SELECT count(*) FROM t")
                     .bind(&meta.signature).bind(meta.ix_index as i16).bind(meta.slot as i64).bind(meta.block_time).bind(pool).bind(base_mint).bind(wallet)
@@ -140,24 +141,96 @@ impl Store {
                       COUNT(*) FILTER (WHERE side='buy') AS buys,
                       COUNT(*) FILTER (WHERE side='sell') AS sells
                FROM trades WHERE block_time > $1 - 86400 GROUP BY token_mint),
+             w1 AS (
+               SELECT token_mint, SUM(quote_raw::float8) AS vol_q,
+                      COUNT(*) FILTER (WHERE side='buy') AS buys, COUNT(*) FILTER (WHERE side='sell') AS sells
+               FROM trades WHERE block_time > $1 - 3600 GROUP BY token_mint),
              p24 AS (
                -- price 24h ago; for tokens younger than 24h (or whose history starts later) the earliest candle's open
                SELECT DISTINCT ON (token_mint) token_mint,
                       CASE WHEN minute <= $1 - 86400 THEN c ELSE o END AS price_then
                FROM candles_1m
-               ORDER BY token_mint, (minute <= $1 - 86400) DESC, CASE WHEN minute <= $1 - 86400 THEN -minute ELSE minute END)
+               ORDER BY token_mint, (minute <= $1 - 86400) DESC, CASE WHEN minute <= $1 - 86400 THEN -minute ELSE minute END),
+             p1 AS (
+               SELECT DISTINCT ON (token_mint) token_mint,
+                      CASE WHEN minute <= $1 - 3600 THEN c ELSE o END AS price_then
+               FROM candles_1m
+               ORDER BY token_mint, (minute <= $1 - 3600) DESC, CASE WHEN minute <= $1 - 3600 THEN -minute ELSE minute END)
              UPDATE token_stats ts SET
                vol_24h_usd = COALESCE(w.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
                buys_24h = COALESCE(w.buys, 0), sells_24h = COALESCE(w.sells, 0),
                change_24h = CASE WHEN p24.price_then > 0 THEN (ts.price_quote / p24.price_then - 1) * 100 END,
+               vol_1h_usd = COALESCE(w1.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
+               buys_1h = COALESCE(w1.buys, 0), sells_1h = COALESCE(w1.sells, 0),
+               change_1h = CASE WHEN p1.price_then > 0 THEN (ts.price_quote / p1.price_then - 1) * 100 END,
                price_usd = ts.price_quote * s.price_usd,
                mcap_usd = CASE WHEN t.supply IS NOT NULL THEN ts.price_quote * s.price_usd * t.supply::float8 / POWER(10, t.decimals) ELSE ts.mcap_usd END,
                updated_at = $1
              FROM tokens t JOIN stocks s ON s.mint = t.quote_mint
              LEFT JOIN w ON w.token_mint = t.mint
+             LEFT JOIN w1 ON w1.token_mint = t.mint
              LEFT JOIN p24 ON p24.token_mint = t.mint
+             LEFT JOIN p1 ON p1.token_mint = t.mint
              WHERE ts.token_mint = t.mint AND (ts.last_trade_at > $1 - 90000 OR w.token_mint IS NOT NULL)")
             .bind(now).execute(&self.db).await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 5-minute window for tokens that traded in the last 6 minutes. Runs every 15s.
+    pub async fn rollup_fast(&self) -> Result<u64> {
+        let now = crate::stocks::chrono_now();
+        let r = sqlx::query(
+            "WITH w AS (
+               SELECT token_mint, SUM(quote_raw::float8) AS vol_q,
+                      COUNT(*) FILTER (WHERE side='buy') AS buys, COUNT(*) FILTER (WHERE side='sell') AS sells
+               FROM trades WHERE block_time > $1 - 300 GROUP BY token_mint)
+             UPDATE token_stats ts SET
+               vol_5m_usd = COALESCE(w.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
+               buys_5m = COALESCE(w.buys, 0), sells_5m = COALESCE(w.sells, 0)
+             FROM tokens t JOIN stocks s ON s.mint = t.quote_mint
+             LEFT JOIN w ON w.token_mint = t.mint
+             WHERE ts.token_mint = t.mint AND (w.token_mint IS NOT NULL OR (ts.last_trade_at > $1 - 400 AND ts.vol_5m_usd > 0))")
+            .bind(now).execute(&self.db).await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Holder analysis from our own tape: net position per wallet = buys - sells. Exact for tokens indexed since birth
+    /// (source='stream'), ignores plain transfers. Pool/curve accounts never appear as wallets, so nothing to exclude.
+    /// Snipers = wallets whose first buy landed within 10s of the token's creation.
+    pub async fn rollup_holders(&self, max_tokens: i64) -> Result<u64> {
+        let now = crate::stocks::chrono_now();
+        let r = sqlx::query(
+            "WITH todo AS (
+               SELECT t.mint, t.creator, t.created_at, t.supply::float8 AS supply
+               FROM tokens t JOIN token_stats ts ON ts.token_mint = t.mint
+               WHERE t.source = 'stream' AND t.supply IS NOT NULL AND t.supply > 0
+                 AND ts.last_trade_at > $1 - 3600
+                 AND (ts.holders_at IS NULL OR ts.holders_at < $1 - CASE WHEN ts.last_trade_at > $1 - 300 THEN 120 ELSE 600 END)
+               ORDER BY ts.holders_at NULLS FIRST LIMIT $2),
+             pos AS (
+               SELECT tr.token_mint, tr.wallet,
+                      SUM(CASE WHEN tr.side='buy' THEN tr.base_raw::float8 ELSE -tr.base_raw::float8 END) AS bal,
+                      MIN(tr.block_time) FILTER (WHERE tr.side='buy') AS first_buy
+               FROM trades tr JOIN todo ON todo.mint = tr.token_mint
+               GROUP BY tr.token_mint, tr.wallet),
+             held AS (SELECT * FROM pos WHERE bal > 0),
+             ranked AS (SELECT token_mint, bal, ROW_NUMBER() OVER (PARTITION BY token_mint ORDER BY bal DESC) AS rn FROM held),
+             agg AS (
+               SELECT h.token_mint,
+                      COUNT(*) AS holders,
+                      SUM(CASE WHEN h.wallet = todo.creator THEN h.bal ELSE 0 END) AS dev_bal,
+                      SUM(CASE WHEN h.first_buy IS NOT NULL AND h.first_buy <= todo.created_at + 10 THEN h.bal ELSE 0 END) AS sniper_bal
+               FROM held h JOIN todo ON todo.mint = h.token_mint GROUP BY h.token_mint),
+             top AS (SELECT token_mint, SUM(bal) AS top10 FROM ranked WHERE rn <= 10 GROUP BY token_mint)
+             UPDATE token_stats ts SET
+               holders = COALESCE(agg.holders, 0),
+               top10_pct = LEAST(100, COALESCE(top.top10, 0) / todo.supply * 100),
+               dev_pct = LEAST(100, COALESCE(agg.dev_bal, 0) / todo.supply * 100),
+               snipers_pct = LEAST(100, COALESCE(agg.sniper_bal, 0) / todo.supply * 100),
+               holders_at = $1
+             FROM todo LEFT JOIN agg ON agg.token_mint = todo.mint LEFT JOIN top ON top.token_mint = todo.mint
+             WHERE ts.token_mint = todo.mint")
+            .bind(now).bind(max_tokens).execute(&self.db).await?;
         Ok(r.rows_affected())
     }
 
