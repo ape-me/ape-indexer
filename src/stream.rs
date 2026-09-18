@@ -8,7 +8,7 @@ use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
-use yellowstone_grpc_proto::geyser::{subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing};
+use yellowstone_grpc_proto::geyser::{subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions, SubscribeRequestPing};
 
 fn request(stocks: Vec<String>, from_slot: Option<u64>) -> SubscribeRequest {
     let mut transactions = HashMap::new();
@@ -18,7 +18,9 @@ fn request(stocks: Vec<String>, from_slot: Option<u64>) -> SubscribeRequest {
             account_include: stocks.clone(), account_exclude: vec![], account_required: vec![p.id().to_string()],
         });
     }
-    SubscribeRequest { transactions, commitment: Some(CommitmentLevel::Confirmed as i32), from_slot, ..Default::default() }
+    let mut blocks_meta = HashMap::new();
+    blocks_meta.insert("meta".to_string(), SubscribeRequestFilterBlocksMeta {});
+    SubscribeRequest { transactions, blocks_meta, commitment: Some(CommitmentLevel::Confirmed as i32), from_slot, ..Default::default() }
 }
 
 pub async fn run(mut store: Store) -> Result<()> {
@@ -44,8 +46,8 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
     let (mut sink, mut stream) = client.subscribe_with_request(Some(request(stocks, from_slot))).await.context("subscribe")?;
     tracing::info!(from_slot, "subscribed");
     let mut last_slot: Option<u64> = None; let mut last_sig: Option<String> = None;
-    let rpc = crate::enrich::Rpc::new();
     let mut block_times: HashMap<u64, i64> = HashMap::new();
+    let mut last_meta: Option<(u64, i64)> = None;
     let mut n_stocks = store.stocks.len();
     let mut last_stock_check = Instant::now();
     let mut last_cursor = Instant::now(); let mut last_reload = Instant::now(); let mut last_rollup = Instant::now();
@@ -56,14 +58,10 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
         match msg.update_oneof {
             Some(UpdateOneof::Transaction(tx)) => {
                 n_tx += 1;
-                // real block time, one RPC call per new slot; falls back to receive time
+                // block time from the stream's BlockMeta for this slot; if it hasn't arrived yet, extrapolate from the newest known slot (400ms/slot)
                 let bt = match block_times.get(&tx.slot) {
                     Some(t) => *t,
-                    None => {
-                        let t = rpc.call("getBlockTime", serde_json::json!([tx.slot])).await.ok().and_then(|v| v.as_i64()).unwrap_or(created);
-                        if block_times.len() > 4096 { block_times.clear(); }
-                        block_times.insert(tx.slot, t); t
-                    }
+                    None => match last_meta { Some((s, t)) => t + ((tx.slot as i64 - s as i64) * 2) / 5, None => created },
                 };
                 let view = match TxView::from_geyser(&tx, bt) { Ok(v) => v, Err(e) => { tracing::warn!(%e, "tx view"); continue } };
                 let stocks = store.stock_set();
@@ -76,6 +74,12 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
                     }
                 }
                 last_slot = Some(tx.slot); last_sig = Some(view.signature);
+            }
+            Some(UpdateOneof::BlockMeta(m)) => {
+                if let Some(t) = m.block_time.as_ref().map(|t| t.timestamp) {
+                    block_times.insert(m.slot, t); last_meta = Some((m.slot, t));
+                    if block_times.len() > 8192 { let cut = m.slot.saturating_sub(4096); block_times.retain(|k, _| *k >= cut); }
+                }
             }
             Some(UpdateOneof::Ping(_)) => { sink.send(SubscribeRequest { ping: Some(SubscribeRequestPing { id: 1 }), ..Default::default() }).await.ok(); }
             _ => {}
