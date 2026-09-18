@@ -63,6 +63,11 @@ pub enum Event {
 
 impl Event {
     pub fn meta(&self) -> &Meta { match self { Event::PoolCreated { meta, .. } | Event::Swap { meta, .. } => meta } }
+    /// (program, kind) labels for metrics.
+    pub fn labels(&self) -> (&'static str, &'static str) {
+        let p = match self.meta().program { Program::Launchlab => "launchlab", Program::Cpmm => "cpmm", Program::Pumpfun => "pumpfun", Program::Pumpswap => "pumpswap", Program::Dbc => "dbc", Program::Damm2 => "damm2" };
+        (p, match self { Event::PoolCreated { .. } => "pool", Event::Swap { .. } => "swap" })
+    }
     /// price in raw quote units per raw base unit. Caller scales by 10^(base_dec - quote_dec).
     pub fn raw_price(&self) -> Option<f64> {
         match self {

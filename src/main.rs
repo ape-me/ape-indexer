@@ -1,4 +1,5 @@
-mod borsh; mod events; mod tx; mod stocks; mod push;
+mod borsh; mod events; mod tx; mod stocks; mod metrics;
+mod push;
 mod store; mod stream; mod enrich; mod backfill;
 #[macro_use] mod decode;
 
@@ -49,6 +50,8 @@ async fn main() -> Result<()> {
             if watch { stocks::price_loop(db).await; }
         }
         Cmd::Stream => {
+            metrics::install();
+            if let Ok(u) = std::env::var("RPC_URL") { tokio::spawn(metrics::rpc_slot_loop(u)); }
             let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
             stocks::sync_list(&db).await?;
             stocks::refresh_prices(&db).await?;

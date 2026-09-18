@@ -29,8 +29,8 @@ pub async fn run(mut store: Store) -> Result<()> {
     if let Some(s) = from_slot { tracing::info!(slot = s, "resuming from cursor"); }
     loop {
         match run_once(&mut store, &url, token.as_deref(), from_slot).await {
-            Ok(last) => { tracing::warn!("stream ended, reconnecting"); from_slot = last; }
-            Err(e) => { tracing::warn!(%e, "stream error, reconnecting in 2s"); from_slot = store.load_cursor().await.ok().flatten(); tokio::time::sleep(Duration::from_secs(2)).await; }
+            Ok(last) => { crate::metrics::stream_connected(false); crate::metrics::reconnect(); tracing::warn!("stream ended, reconnecting"); from_slot = last; }
+            Err(e) => { crate::metrics::stream_connected(false); crate::metrics::reconnect(); tracing::warn!(%e, "stream error, reconnecting in 2s"); from_slot = store.load_cursor().await.ok().flatten(); tokio::time::sleep(Duration::from_secs(2)).await; }
         }
     }
 }
@@ -45,6 +45,7 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
     let stocks: Vec<String> = store.stock_set().into_iter().collect();
     let (mut sink, mut stream) = client.subscribe_with_request(Some(request(stocks, from_slot))).await.context("subscribe")?;
     tracing::info!(from_slot, "subscribed");
+    crate::metrics::stream_connected(true); crate::metrics::stocks(store.stocks.len());
     let mut last_slot: Option<u64> = None; let mut last_sig: Option<String> = None;
     let mut block_times: HashMap<u64, i64> = HashMap::new();
     let mut last_meta: Option<(u64, i64)> = None;
@@ -63,7 +64,7 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
         let mut ready: Vec<(SubscribeUpdateTransaction, i64)> = Vec::new();
         match msg.update_oneof {
             Some(UpdateOneof::Transaction(tx)) => {
-                n_tx += 1;
+                n_tx += 1; crate::metrics::tx(); crate::metrics::stream_delay(created);
                 match block_times.get(&tx.slot) {
                     Some(t) => ready.push((tx, *t)),
                     None => pending.entry(tx.slot).or_insert_with(|| (Instant::now(), Vec::new())).1.push(tx),
@@ -71,7 +72,7 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
             }
             Some(UpdateOneof::BlockMeta(m)) => {
                 if let Some(t) = m.block_time.as_ref().map(|t| t.timestamp) {
-                    block_times.insert(m.slot, t); last_meta = Some((m.slot, t));
+                    block_times.insert(m.slot, t); last_meta = Some((m.slot, t)); crate::metrics::chain_slot(m.slot);
                     if block_times.len() > 8192 { let cut = m.slot.saturating_sub(4096); block_times.retain(|k, _| *k >= cut); }
                 }
             }
@@ -84,30 +85,36 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
             let (_, txs) = pending.remove(&slot).unwrap();
             let bt = match block_times.get(&slot) {
                 Some(t) => *t,
-                None => { tracing::warn!(slot, "no block meta, extrapolating time"); match last_meta { Some((s, t)) => t + ((slot as i64 - s as i64) * 2 + 2) / 5, None => created } }
+                None => { crate::metrics::extrapolated(); tracing::warn!(slot, "no block meta, extrapolating time"); match last_meta { Some((s, t)) => t + ((slot as i64 - s as i64) * 2 + 2) / 5, None => created } }
             };
             for tx in txs { ready.push((tx, bt)); }
         }
         ready.sort_by_key(|(tx, _)| tx.slot);
+        crate::metrics::pending_slots(pending.len());
         for (tx, bt) in ready {
             let view = match TxView::from_geyser(&tx, bt) { Ok(v) => v, Err(e) => { tracing::warn!(%e, "tx view"); continue } };
             let stocks = store.stock_set();
             for ev in decode::decode(&view, &stocks) {
-                match store.apply(&ev).await {
-                    Ok(true) => n_ev += 1,
-                    Ok(false) => {}
+                let (program, kind) = ev.labels();
+                crate::metrics::event(program, kind);
+                let t0 = Instant::now();
+                let r = store.apply(&ev).await;
+                crate::metrics::apply_took(t0.elapsed());
+                match r {
+                    Ok(true) => { n_ev += 1; if kind == "swap" { crate::metrics::trade_stored(program); crate::metrics::e2e(bt); crate::metrics::newest_trade_age(bt); } }
+                    Ok(false) => { if kind == "swap" { crate::metrics::trade_dup(); } }
                     // a failed write must not be skipped: drop the connection and replay from the last saved cursor
-                    Err(e) => { tracing::error!(%e, sig = %view.signature, "apply failed, replaying from cursor"); anyhow::bail!("apply: {e}"); }
+                    Err(e) => { crate::metrics::apply_error(); tracing::error!(%e, sig = %view.signature, "apply failed, replaying from cursor"); anyhow::bail!("apply: {e}"); }
                 }
             }
-            last_slot = Some(tx.slot); last_sig = Some(view.signature);
+            last_slot = Some(tx.slot); last_sig = Some(view.signature); crate::metrics::indexer_slot(tx.slot);
         }
         if last_cursor.elapsed() > Duration::from_secs(5) { if let Some(s) = last_slot { store.save_cursor(s, last_sig.as_deref()).await.ok(); } last_cursor = Instant::now(); }
         if last_reload.elapsed() > Duration::from_secs(60) { store.reload().await.ok(); last_reload = Instant::now(); }
         if last_stock_check.elapsed() > Duration::from_secs(600) {
             last_stock_check = Instant::now();
             if let Ok(set) = crate::stocks::sync_list(&store.db).await { let _ = store.reload().await;
-                if set.len() != n_stocks { n_stocks = set.len(); tracing::info!(n = n_stocks, "stock list changed, resubscribing"); sink.send(request(set.into_iter().collect(), None)).await.ok(); }
+                if set.len() != n_stocks { n_stocks = set.len(); crate::metrics::stocks(n_stocks); tracing::info!(n = n_stocks, "stock list changed, resubscribing"); sink.send(request(set.into_iter().collect(), None)).await.ok(); }
             }
         }
         if last_rollup.elapsed() > Duration::from_secs(60) { match store.rollup().await { Ok(n) => tracing::debug!(n, "rollup"), Err(e) => tracing::warn!(%e, "rollup") } last_rollup = Instant::now(); }

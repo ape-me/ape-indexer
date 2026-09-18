@@ -67,8 +67,9 @@ pub async fn refresh_prices(db: &PgPool) -> Result<usize> {
 
 pub async fn price_loop(db: PgPool) {
     loop {
-        match refresh_prices(&db).await { Ok(n) => tracing::info!(n, "stock prices refreshed"), Err(e) => tracing::warn!(%e, "price loop") }
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        let last = std::time::Instant::now();
+        match refresh_prices(&db).await { Ok(n) => { crate::metrics::stock_prices_refreshed(); tracing::info!(n, "stock prices refreshed") }, Err(e) => tracing::warn!(%e, "price loop") }
+        for _ in 0..30 { tokio::time::sleep(Duration::from_secs(1)).await; crate::metrics::stock_prices_age(last.elapsed().as_secs_f64()); }
     }
 }
 

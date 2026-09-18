@@ -50,15 +50,16 @@ async fn run(url: String, secret: String, mut rx: mpsc::UnboundedReceiver<Ingest
         let trades: Vec<IngestTrade> = buf.drain(..).collect();
         let body = serde_json::to_string(&Batch { trades: &trades, sent_at: crate::stocks::chrono_now() }).expect("json");
         let sig = sign(&secret, &body);
-        let mut ok = false;
+        let mut ok = false; let t0 = std::time::Instant::now();
         for attempt in 0..3u32 {
             match client.post(&url).header("content-type", "application/json").header("x-signature", &sig).body(body.clone()).send().await {
                 Ok(r) if r.status().is_success() => { ok = true; break }
-                Ok(r) => tracing::warn!(status = %r.status(), attempt, "push rejected"),
-                Err(e) => tracing::warn!(%e, attempt, "push failed"),
+                Ok(r) => { crate::metrics::push("failed", 0, t0.elapsed()); tracing::warn!(status = %r.status(), attempt, "push rejected") }
+                Err(e) => { crate::metrics::push("failed", 0, t0.elapsed()); tracing::warn!(%e, attempt, "push failed") }
             }
             tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
         }
+        crate::metrics::push(if ok { "ok" } else { "dropped" }, trades.len(), t0.elapsed());
         if ok { tracing::debug!(n = trades.len(), "pushed") } else { tracing::error!(n = trades.len(), "push dropped") }
     }
 }
