@@ -141,8 +141,11 @@ impl Store {
                       COUNT(*) FILTER (WHERE side='sell') AS sells
                FROM trades WHERE block_time > $1 - 86400 GROUP BY token_mint),
              p24 AS (
-               SELECT DISTINCT ON (token_mint) token_mint, c AS price_then FROM candles_1m
-               WHERE minute <= $1 - 86400 ORDER BY token_mint, minute DESC)
+               -- price 24h ago; for tokens younger than 24h (or whose history starts later) the earliest candle's open
+               SELECT DISTINCT ON (token_mint) token_mint,
+                      CASE WHEN minute <= $1 - 86400 THEN c ELSE o END AS price_then
+               FROM candles_1m
+               ORDER BY token_mint, (minute <= $1 - 86400) DESC, CASE WHEN minute <= $1 - 86400 THEN -minute ELSE minute END)
              UPDATE token_stats ts SET
                vol_24h_usd = COALESCE(w.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
                buys_24h = COALESCE(w.buys, 0), sells_24h = COALESCE(w.sells, 0),
