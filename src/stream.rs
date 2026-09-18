@@ -5,10 +5,10 @@ use crate::store::Store;
 use crate::tx::TxView;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
-use yellowstone_grpc_proto::geyser::{subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions, SubscribeRequestPing};
+use yellowstone_grpc_proto::geyser::{subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateTransaction};
 
 fn request(stocks: Vec<String>, from_slot: Option<u64>) -> SubscribeRequest {
     let mut transactions = HashMap::new();
@@ -52,28 +52,22 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
     let mut last_stock_check = Instant::now();
     let mut last_cursor = Instant::now(); let mut last_reload = Instant::now(); let mut last_rollup = Instant::now();
     let mut n_tx = 0u64; let mut n_ev = 0u64; let mut last_log = Instant::now();
+    // Transactions are held until the BlockMeta for their slot arrives (it follows the block's transactions),
+    // so every trade carries the chain's exact block_time. A slot whose meta never shows up is flushed after
+    // PENDING_MAX with a time extrapolated from the newest known slot (400ms per slot).
+    const PENDING_MAX: Duration = Duration::from_secs(3);
+    let mut pending: BTreeMap<u64, (Instant, Vec<SubscribeUpdateTransaction>)> = BTreeMap::new();
     while let Some(msg) = stream.next().await {
         let msg = msg.context("stream recv")?;
         let created = msg.created_at.as_ref().map(|t| t.seconds).unwrap_or_else(crate::stocks::chrono_now);
+        let mut ready: Vec<(SubscribeUpdateTransaction, i64)> = Vec::new();
         match msg.update_oneof {
             Some(UpdateOneof::Transaction(tx)) => {
                 n_tx += 1;
-                // block time from the stream's BlockMeta for this slot; if it hasn't arrived yet, extrapolate from the newest known slot (400ms/slot)
-                let bt = match block_times.get(&tx.slot) {
-                    Some(t) => *t,
-                    None => match last_meta { Some((s, t)) => t + ((tx.slot as i64 - s as i64) * 2) / 5, None => created },
-                };
-                let view = match TxView::from_geyser(&tx, bt) { Ok(v) => v, Err(e) => { tracing::warn!(%e, "tx view"); continue } };
-                let stocks = store.stock_set();
-                for ev in decode::decode(&view, &stocks) {
-                    match store.apply(&ev).await {
-                        Ok(true) => n_ev += 1,
-                        Ok(false) => {}
-                        // a failed write must not be skipped: drop the connection and replay from the last saved cursor
-                        Err(e) => { tracing::error!(%e, sig = %view.signature, "apply failed, replaying from cursor"); anyhow::bail!("apply: {e}"); }
-                    }
+                match block_times.get(&tx.slot) {
+                    Some(t) => ready.push((tx, *t)),
+                    None => pending.entry(tx.slot).or_insert_with(|| (Instant::now(), Vec::new())).1.push(tx),
                 }
-                last_slot = Some(tx.slot); last_sig = Some(view.signature);
             }
             Some(UpdateOneof::BlockMeta(m)) => {
                 if let Some(t) = m.block_time.as_ref().map(|t| t.timestamp) {
@@ -83,6 +77,30 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
             }
             Some(UpdateOneof::Ping(_)) => { sink.send(SubscribeRequest { ping: Some(SubscribeRequestPing { id: 1 }), ..Default::default() }).await.ok(); }
             _ => {}
+        }
+        // release every buffered slot that now has an exact time, or has waited too long
+        let due: Vec<u64> = pending.iter().filter(|(s, (at, _))| block_times.contains_key(s) || at.elapsed() > PENDING_MAX).map(|(s, _)| *s).collect();
+        for slot in due {
+            let (_, txs) = pending.remove(&slot).unwrap();
+            let bt = match block_times.get(&slot) {
+                Some(t) => *t,
+                None => { tracing::warn!(slot, "no block meta, extrapolating time"); match last_meta { Some((s, t)) => t + ((slot as i64 - s as i64) * 2 + 2) / 5, None => created } }
+            };
+            for tx in txs { ready.push((tx, bt)); }
+        }
+        ready.sort_by_key(|(tx, _)| tx.slot);
+        for (tx, bt) in ready {
+            let view = match TxView::from_geyser(&tx, bt) { Ok(v) => v, Err(e) => { tracing::warn!(%e, "tx view"); continue } };
+            let stocks = store.stock_set();
+            for ev in decode::decode(&view, &stocks) {
+                match store.apply(&ev).await {
+                    Ok(true) => n_ev += 1,
+                    Ok(false) => {}
+                    // a failed write must not be skipped: drop the connection and replay from the last saved cursor
+                    Err(e) => { tracing::error!(%e, sig = %view.signature, "apply failed, replaying from cursor"); anyhow::bail!("apply: {e}"); }
+                }
+            }
+            last_slot = Some(tx.slot); last_sig = Some(view.signature);
         }
         if last_cursor.elapsed() > Duration::from_secs(5) { if let Some(s) = last_slot { store.save_cursor(s, last_sig.as_deref()).await.ok(); } last_cursor = Instant::now(); }
         if last_reload.elapsed() > Duration::from_secs(60) { store.reload().await.ok(); last_reload = Instant::now(); }
