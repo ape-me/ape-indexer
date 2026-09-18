@@ -53,11 +53,15 @@ pub fn decode(ctx: &Ctx) -> Vec<Event> {
             SWAP_BASE_INPUT | SWAP_BASE_OUTPUT if a.len() > 11 => {
                 let Some(l) = logs.get(li) else { continue }; li += 1;
                 let Some((base, quote)) = orient(&l.in_mint, &l.out_mint, ctx.stocks) else { continue };
-                let in_after = l.in_before + l.in_amt - l.in_fee; let out_after = l.out_before - l.out_amt;
+                // input_amount is what reached the vault (transfer tax already withheld); output_amount is what left it.
+                // Reserves use vault amounts; the trade row uses wallet amounts (tax added back on input, taken off output),
+                // so the tape matches what the trader paid and received, as explorers show it.
+                let in_after = l.in_before + l.in_amt; let out_after = l.out_before - l.out_amt;
+                let paid = l.in_amt + l.in_fee; let got = l.out_amt - l.out_fee;
                 let (side, base_raw, quote_raw, rb, rq) = if l.in_mint == quote {
-                    (Side::Buy, l.out_amt - l.out_fee, l.in_amt, out_after, in_after)
+                    (Side::Buy, got, paid, out_after, in_after)
                 } else {
-                    (Side::Sell, l.in_amt, l.out_amt - l.out_fee, in_after, out_after)
+                    (Side::Sell, paid, got, in_after, out_after)
                 };
                 out.push(Event::Swap { meta: ctx.meta(i as u16), pool: l.pool.clone(), base_mint: base, quote_mint: quote, wallet: a[0].clone(), side,
                     base_raw: base_raw as u128, quote_raw: quote_raw as u128, reserve_base_raw: Some(rb as u128), reserve_quote_raw: Some(rq as u128), sqrt_price_q64: None });
