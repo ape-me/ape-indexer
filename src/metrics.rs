@@ -16,7 +16,7 @@ pub fn install() {
 fn describe() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
     describe_gauge!("ape_chain_slot", "newest confirmed slot seen on the Kaldera stream (BlockMeta)");
-    describe_gauge!("ape_rpc_slot", "confirmed slot from the RPC, polled every 10s");
+    describe_gauge!("ape_rpc_slot", "confirmed slot from the RPC, polled every 2s");
     describe_gauge!("ape_indexer_slot", "slot of the last transaction the indexer processed");
     describe_gauge!("ape_newest_trade_age_seconds", "now minus block_time of the newest stored trade");
     describe_gauge!("ape_pending_slots", "slots buffered waiting for their BlockMeta");
@@ -64,7 +64,7 @@ pub fn apply_took(d: Duration) { histogram!("ape_apply_seconds").record(d.as_sec
 pub fn stream_delay(created_at: i64) { histogram!("ape_stream_delay_seconds").record((crate::stocks::chrono_now() - created_at).max(0) as f64); }
 pub fn e2e(block_time: i64) { histogram!("ape_e2e_seconds").record((crate::stocks::chrono_now() - block_time).max(0) as f64); }
 
-/// Polls the RPC's confirmed slot every 10s so a silent stream still shows as lag.
+/// Polls the RPC's confirmed slot every 2s so a silent stream still shows as lag.
 pub async fn rpc_slot_loop(rpc_url: String) {
     let c = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
     loop {
@@ -72,6 +72,6 @@ pub async fn rpc_slot_loop(rpc_url: String) {
             Ok(r) => match r.json::<serde_json::Value>().await { Ok(v) => if let Some(s) = v["result"].as_u64() { gauge!("ape_rpc_slot").set(s as f64); }, Err(_) => rpc_error() },
             Err(_) => rpc_error(),
         }
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

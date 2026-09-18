@@ -98,22 +98,30 @@ impl Store {
                 let price_quote = raw_price * scale;
                 let base = *base_raw as f64 / 10f64.powi(bd);
                 let quote = *quote_raw as f64 / 10f64.powi(qd);
-                let ins = sqlx::query("INSERT INTO trades (signature, ix_index, slot, block_time, pool, token_mint, wallet, side, base_raw, quote_raw, price_quote)
-                                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING")
-                    .bind(&meta.signature).bind(meta.ix_index as i16).bind(meta.slot as i64).bind(meta.block_time).bind(pool).bind(base_mint).bind(wallet)
-                    .bind(match side { Side::Buy => "buy", Side::Sell => "sell" }).bind(BigDecimal::from(*base_raw)).bind(BigDecimal::from(*quote_raw)).bind(price_quote)
-                    .execute(&self.db).await?;
-                if ins.rows_affected() == 0 { return Ok(false); } // replayed duplicate
                 let minute = meta.block_time - meta.block_time.rem_euclid(60);
-                sqlx::query("INSERT INTO candles_1m (token_mint, minute, o, h, l, c, vol_quote, n) VALUES ($1,$2,$3,$3,$3,$3,$4,1)
-                             ON CONFLICT (token_mint, minute) DO UPDATE SET h=GREATEST(candles_1m.h,$3), l=LEAST(candles_1m.l,$3), c=$3, vol_quote=candles_1m.vol_quote+$4, n=candles_1m.n+1")
-                    .bind(base_mint).bind(minute).bind(price_quote).bind(quote).execute(&self.db).await?;
                 let usd = self.stock_usd.get(quote_mint).copied();
                 let price_usd = usd.map(|u| price_quote * u);
                 let mcap = price_usd.and_then(|p| info.supply.map(|s| p * s / 10f64.powi(bd)));
-                sqlx::query("INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, last_trade_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5)
-                             ON CONFLICT (token_mint) DO UPDATE SET price_quote=$2, price_usd=$3, mcap_usd=COALESCE($4, token_stats.mcap_usd), last_trade_at=$5, updated_at=$5")
-                    .bind(base_mint).bind(price_quote).bind(price_usd).bind(mcap).bind(meta.block_time).execute(&self.db).await?;
+                // One round trip: insert the trade, and only if it was new (not a replay), fold the candle and refresh stats.
+                let ins: (i64,) = sqlx::query_as(
+                    "WITH t AS (
+                       INSERT INTO trades (signature, ix_index, slot, block_time, pool, token_mint, wallet, side, base_raw, quote_raw, price_quote)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING RETURNING 1
+                     ), c AS (
+                       INSERT INTO candles_1m (token_mint, minute, o, h, l, c, vol_quote, n)
+                       SELECT $6, $12, $11, $11, $11, $11, $13, 1 WHERE EXISTS (SELECT 1 FROM t)
+                       ON CONFLICT (token_mint, minute) DO UPDATE SET h=GREATEST(candles_1m.h,$11), l=LEAST(candles_1m.l,$11), c=$11, vol_quote=candles_1m.vol_quote+$13, n=candles_1m.n+1
+                     ), s AS (
+                       INSERT INTO token_stats (token_mint, price_quote, price_usd, mcap_usd, last_trade_at, updated_at)
+                       SELECT $6, $11, $14, $15, $4, $4 WHERE EXISTS (SELECT 1 FROM t)
+                       ON CONFLICT (token_mint) DO UPDATE SET price_quote=$11, price_usd=$14, mcap_usd=COALESCE($15, token_stats.mcap_usd), last_trade_at=$4, updated_at=$4
+                     )
+                     SELECT count(*) FROM t")
+                    .bind(&meta.signature).bind(meta.ix_index as i16).bind(meta.slot as i64).bind(meta.block_time).bind(pool).bind(base_mint).bind(wallet)
+                    .bind(match side { Side::Buy => "buy", Side::Sell => "sell" }).bind(BigDecimal::from(*base_raw)).bind(BigDecimal::from(*quote_raw)).bind(price_quote)
+                    .bind(minute).bind(quote).bind(price_usd).bind(mcap)
+                    .fetch_one(&self.db).await?;
+                if ins.0 == 0 { return Ok(false); } // replayed duplicate
                 if let Some(p) = &self.push {
                     p.send(crate::push::IngestTrade { mint: base_mint.clone(), pool: pool.clone(), program: meta.program, sig: meta.signature.clone(), ts: meta.block_time, slot: meta.slot, side: *side, wallet: wallet.clone(), base, quote, price_quote, price_usd });
                 }
