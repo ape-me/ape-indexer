@@ -23,7 +23,10 @@ fn client() -> reqwest::Client {
 }
 
 fn issuer(cat: &str) -> &'static str { match cat { "xstock" => "xstocks", "backpack" => "backpack", "prestock" => "prestocks", _ => "other" } }
+/// Crypto pairs Backpack lists next to equities. They keep their floors but are not counted as stocks.
+const CRYPTO: [&str; 12] = ["ARB", "CHIP", "DOGE", "INJ", "LINK", "PEPE", "TAO", "PEAQ", "PONS", "ROBOSTRATEGY", "PSG", "PENG"];
 fn category(cat: &str, symbol: &str) -> &'static str {
+    if CRYPTO.contains(&symbol) { return "crypto" }
     match cat { "prestock" => "preipo", _ => if symbol.ends_with('X') && ["SPY", "QQQ", "TQQQ", "GLD", "VTI", "IWM", "DIA"].iter().any(|e| symbol.starts_with(e)) { "etf" } else { "stock" } }
 }
 
