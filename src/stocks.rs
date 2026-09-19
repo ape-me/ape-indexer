@@ -48,7 +48,7 @@ const PRESTOCKS: &str = "https://prestocks.com/api/prestocks";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PreStock { contract_address: String, mark_price: Option<f64>, mark_valuation: Option<f64>, implied_valuation: Option<f64>, supply: Option<f64> }
+struct PreStock { #[serde(rename = "contract_address")] contract_address: String, mark_price: Option<f64>, mark_valuation: Option<f64>, implied_valuation: Option<f64>, supply: Option<f64> }
 
 /// PreStocks' own numbers per mint: mark price of the underlying, valuations, supply. Empty map on any failure.
 async fn prestocks_marks(c: &reqwest::Client) -> std::collections::HashMap<String, PreStock> {
