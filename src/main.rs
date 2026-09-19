@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
         Cmd::Stocks { watch } => {
             let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
             let mints = stocks::sync_list(&db).await?;
-            let n = stocks::refresh_prices(&db).await?;
+            let n = stocks::refresh_prices(&db, false).await?;
             println!("stocks={} priced={}", mints.len(), n);
             if watch { stocks::price_loop(db).await; }
         }
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
             if let Ok(u) = std::env::var("RPC_URL") { tokio::spawn(metrics::rpc_slot_loop(u)); }
             let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
             stocks::sync_list(&db).await?;
-            stocks::refresh_prices(&db).await?;
+            stocks::refresh_prices(&db, false).await?;
             tokio::spawn(stocks::price_loop(db.clone()));
             tokio::spawn(enrich::run(db.clone()));
             tokio::spawn(enrich::dex_paid_loop(db.clone()));
