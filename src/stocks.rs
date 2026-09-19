@@ -7,7 +7,11 @@ use std::time::Duration;
 
 const STONKFUN: &str = "https://www.stonkfun.xyz/api/quote-tokens";
 const DEXSCREENER: &str = "https://api.dexscreener.com/tokens/v1/solana/";
-const STOCK_CATEGORIES: [&str; 4] = ["xstock", "backpack", "prestock", "tessera"];
+const STOCK_CATEGORIES: [&str; 3] = ["xstock", "backpack", "prestock"];
+/// Non-PreStocks pre-IPO mints. Never indexed: PreStocks bounty disqualifies any project that integrates them.
+const EXCLUDED_MINTS: [&str; 1] = [
+    "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", // SPCXx (xStocks SpaceX)
+];
 
 #[derive(Deserialize)]
 struct QuoteToken { #[serde(rename = "quoteMint")] mint: String, symbol: String, name: String, decimals: i16, #[serde(rename = "logoUrl")] logo: Option<String>, category: String }
@@ -18,9 +22,9 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().user_agent("ape-indexer/0.1").timeout(Duration::from_secs(15)).build().unwrap()
 }
 
-fn issuer(cat: &str) -> &'static str { match cat { "xstock" => "xstocks", "backpack" => "backpack", "prestock" => "prestocks", "tessera" => "tessera", _ => "other" } }
+fn issuer(cat: &str) -> &'static str { match cat { "xstock" => "xstocks", "backpack" => "backpack", "prestock" => "prestocks", _ => "other" } }
 fn category(cat: &str, symbol: &str) -> &'static str {
-    match cat { "prestock" | "tessera" => "preipo", _ => if symbol.ends_with('X') && ["SPY", "QQQ", "TQQQ", "GLD", "VTI", "IWM", "DIA"].iter().any(|e| symbol.starts_with(e)) { "etf" } else { "stock" } }
+    match cat { "prestock" => "preipo", _ => if symbol.ends_with('X') && ["SPY", "QQQ", "TQQQ", "GLD", "VTI", "IWM", "DIA"].iter().any(|e| symbol.starts_with(e)) { "etf" } else { "stock" } }
 }
 
 /// Upsert the stock list. Returns the set of stock mints.
@@ -28,7 +32,7 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     let list: QuoteList = client().get(STONKFUN).send().await?.error_for_status()?.json().await.context("stonkfun quote-tokens")?;
     let now = chrono_now();
     let mut mints = HashSet::new();
-    for t in list.tokens.into_iter().filter(|t| STOCK_CATEGORIES.contains(&t.category.as_str())) {
+    for t in list.tokens.into_iter().filter(|t| STOCK_CATEGORIES.contains(&t.category.as_str()) && !EXCLUDED_MINTS.contains(&t.mint.as_str())) {
         let logo = t.logo.map(|l| if l.starts_with('/') { format!("https://www.stonkfun.xyz{l}") } else { l });
         sqlx::query("INSERT INTO stocks (mint, symbol, name, issuer, category, decimals, logo, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                      ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, name=EXCLUDED.name, issuer=EXCLUDED.issuer, category=EXCLUDED.category, decimals=EXCLUDED.decimals, logo=EXCLUDED.logo")

@@ -1,0 +1,7 @@
+target/
+node_modules/
+soak/
+*.log
+.env
+watchdog.*
+.git/

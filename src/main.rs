@@ -31,7 +31,7 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::from_path("/root/ape-indexer/.env");
+    let _ = dotenvy::dotenv(); // optional: in Docker the env comes from compose
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
     match Cli::parse().cmd {
         Cmd::DecodeFiles { stocks, files } => {

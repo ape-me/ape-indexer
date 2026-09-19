@@ -4,7 +4,7 @@ CREATE TABLE stocks (
   mint        TEXT PRIMARY KEY,
   symbol      TEXT NOT NULL,
   name        TEXT NOT NULL,
-  issuer      TEXT NOT NULL,            -- xstocks | backpack | prestocks | tessera
+  issuer      TEXT NOT NULL,            -- xstocks | backpack | prestocks
   category    TEXT NOT NULL,            -- stock | etf | preipo | index
   decimals    SMALLINT NOT NULL,
   logo        TEXT,
