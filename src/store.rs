@@ -134,7 +134,7 @@ impl Store {
                     .fetch_one(&self.db).await?;
                 if ins.0 == 0 { return Ok(false); } // replayed duplicate
                 if let Some(p) = &self.push {
-                    p.send(crate::push::IngestTrade { mint: base_mint.clone(), pool: pool.clone(), program: meta.program, sig: meta.signature.clone(), ts: meta.block_time, slot: meta.slot, side: *side, wallet: wallet.clone(), base, quote, price_quote, price_usd });
+                    p.send(crate::push::IngestTrade { mint: base_mint.clone(), pool: pool.clone(), program: meta.program, sig: meta.signature.clone(), ts: meta.block_time, slot: meta.slot, side: *side, wallet: wallet.clone(), base, quote, price_quote, price_usd, quote_mint: quote_mint.clone() });
                 }
                 Ok(true)
             }
@@ -146,15 +146,19 @@ impl Store {
         let now = crate::stocks::chrono_now();
         let r = sqlx::query(
             "WITH w AS (
-               SELECT token_mint,
-                      SUM(quote_raw::float8) AS vol_q,
-                      COUNT(*) FILTER (WHERE side='buy') AS buys,
-                      COUNT(*) FILTER (WHERE side='sell') AS sells
-               FROM trades WHERE block_time > $1 - 86400 GROUP BY token_mint),
+               -- USD at trade time (quote_usd), falling back to the stock's current price for rows without it
+               SELECT tr.token_mint,
+                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, s.price_usd)) AS vol_usd,
+                      COUNT(*) FILTER (WHERE tr.side='buy') AS buys,
+                      COUNT(*) FILTER (WHERE tr.side='sell') AS sells
+               FROM trades tr JOIN tokens tk ON tk.mint = tr.token_mint JOIN stocks s ON s.mint = tk.quote_mint
+               WHERE tr.block_time > $1 - 86400 GROUP BY tr.token_mint),
              w1 AS (
-               SELECT token_mint, SUM(quote_raw::float8) AS vol_q,
-                      COUNT(*) FILTER (WHERE side='buy') AS buys, COUNT(*) FILTER (WHERE side='sell') AS sells
-               FROM trades WHERE block_time > $1 - 3600 GROUP BY token_mint),
+               SELECT tr.token_mint,
+                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, s.price_usd)) AS vol_usd,
+                      COUNT(*) FILTER (WHERE tr.side='buy') AS buys, COUNT(*) FILTER (WHERE tr.side='sell') AS sells
+               FROM trades tr JOIN tokens tk ON tk.mint = tr.token_mint JOIN stocks s ON s.mint = tk.quote_mint
+               WHERE tr.block_time > $1 - 3600 GROUP BY tr.token_mint),
              p24 AS (
                -- price 24h ago; for tokens younger than 24h (or whose history starts later) the earliest candle's open
                SELECT DISTINCT ON (token_mint) token_mint,
@@ -167,10 +171,10 @@ impl Store {
                FROM candles_1m
                ORDER BY token_mint, (minute <= $1 - 3600) DESC, CASE WHEN minute <= $1 - 3600 THEN -minute ELSE minute END)
              UPDATE token_stats ts SET
-               vol_24h_usd = COALESCE(w.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
+               vol_24h_usd = COALESCE(w.vol_usd, 0),
                buys_24h = COALESCE(w.buys, 0), sells_24h = COALESCE(w.sells, 0),
                change_24h = CASE WHEN p24.price_then > 0 THEN (ts.price_quote / p24.price_then - 1) * 100 END,
-               vol_1h_usd = COALESCE(w1.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
+               vol_1h_usd = COALESCE(w1.vol_usd, 0),
                buys_1h = COALESCE(w1.buys, 0), sells_1h = COALESCE(w1.sells, 0),
                change_1h = CASE WHEN p1.price_then > 0 THEN (ts.price_quote / p1.price_then - 1) * 100 END,
                price_usd = ts.price_quote * s.price_usd,
@@ -183,7 +187,35 @@ impl Store {
              LEFT JOIN p1 ON p1.token_mint = t.mint
              WHERE ts.token_mint = t.mint AND (ts.last_trade_at > $1 - 90000 OR w.token_mint IS NOT NULL)")
             .bind(now).execute(&self.db).await?;
+        self.rollup_stocks(now).await?;
         Ok(r.rows_affected())
+    }
+
+    /// Per-floor 24h numbers (launches, volume, wallets, heat, king). One statement, every 60s, read by /api/stocks.
+    async fn rollup_stocks(&self, now: i64) -> Result<()> {
+        sqlx::query(
+            "WITH f AS (
+               SELECT s.mint, COUNT(k.mint) FILTER (WHERE k.created_at > $1 - 86400)::int AS launched
+               FROM stocks s LEFT JOIN tokens k ON k.quote_mint = s.mint GROUP BY s.mint),
+             v AS (
+               SELECT k.quote_mint AS mint,
+                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, s.price_usd)) AS vol,
+                      COUNT(*)::int AS trades, COUNT(DISTINCT tr.wallet)::int AS wallets
+               FROM trades tr JOIN tokens k ON k.mint = tr.token_mint JOIN stocks s ON s.mint = k.quote_mint
+               WHERE tr.block_time > $1 - 86400 GROUP BY k.quote_mint),
+             king AS (
+               SELECT DISTINCT ON (k.quote_mint) k.quote_mint AS mint, k.mint AS king_mint
+               FROM tokens k JOIN token_stats st ON st.token_mint = k.mint
+               WHERE st.vol_24h_usd > 0 ORDER BY k.quote_mint, st.vol_24h_usd DESC)
+             INSERT INTO stock_stats (mint, launched_24h, meme_vol_24h, trades_24h, wallets_24h, heat, king_mint, updated_at)
+             SELECT f.mint, f.launched, COALESCE(v.vol, 0), COALESCE(v.trades, 0), COALESCE(v.wallets, 0),
+                    f.launched * 10 + COALESCE(v.wallets, 0) + COALESCE(v.vol, 0) / 1000, king.king_mint, $1
+             FROM f LEFT JOIN v ON v.mint = f.mint LEFT JOIN king ON king.mint = f.mint
+             ON CONFLICT (mint) DO UPDATE SET launched_24h = EXCLUDED.launched_24h, meme_vol_24h = EXCLUDED.meme_vol_24h,
+               trades_24h = EXCLUDED.trades_24h, wallets_24h = EXCLUDED.wallets_24h, heat = EXCLUDED.heat,
+               king_mint = EXCLUDED.king_mint, updated_at = EXCLUDED.updated_at")
+            .bind(now).execute(&self.db).await?;
+        Ok(())
     }
 
     /// 5-minute window for tokens that traded in the last 6 minutes. Runs every 15s.

@@ -13,6 +13,7 @@ pub struct IngestTrade {
     pub mint: String, pub pool: String, pub program: crate::events::Program,
     pub sig: String, pub ts: i64, pub slot: u64, pub side: crate::events::Side, pub wallet: String,
     pub base: f64, pub quote: f64, pub price_quote: f64, pub price_usd: Option<f64>,
+    pub quote_mint: String,
 }
 
 /// A token event: `created` when a curve pool is initialised, `graduated` when its AMM pool appears.
