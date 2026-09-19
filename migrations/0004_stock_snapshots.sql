@@ -9,7 +9,7 @@ ALTER TABLE stocks
   ADD COLUMN IF NOT EXISTS mcap_usd          DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS change_1h         DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS mark_usd          DOUBLE PRECISION,   -- PreStocks: price of the underlying (their mark)
-  ADD COLUMN IF NOT EXISTS premium_pct       DOUBLE PRECISION,   -- PreStocks: token price vs mark, +5 = trades 5% above
+  ADD COLUMN IF NOT EXISTS premium_pct       DOUBLE PRECISION,   -- token price vs mark (PreStocks mark, or the real underlying stock price for xStocks/Backpack), +5 = trades 5% above
   ADD COLUMN IF NOT EXISTS mark_valuation    DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS implied_valuation DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS supply            DOUBLE PRECISION;

@@ -48,6 +48,30 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
 }
 
 const PRESTOCKS: &str = "https://prestocks.com/api/prestocks";
+const JUPITER_PRICE: &str = "https://lite-api.jup.ag/price/v3?ids=";
+
+/// Jupiter's aggregated price per mint: routes across every pool, so it is what a buyer actually pays.
+/// DexScreener only sees the pools it lists (OPENAI was +48% off). `stockData` carries the underlying stock's
+/// real price for tokenized equities, which gives premium-to-underlying for xStocks/Backpack too.
+struct JupPrice { usd: f64, liquidity: Option<f64>, underlying: Option<f64>, underlying_mcap: Option<f64> }
+async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> std::collections::HashMap<String, JupPrice> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in mints.chunks(50) {
+        let url = format!("{JUPITER_PRICE}{}", chunk.join(","));
+        let v: serde_json::Value = match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
+            Ok(r) => r.json().await.unwrap_or_default(),
+            Err(e) => { tracing::warn!(%e, "jupiter price"); continue }
+        };
+        if let Some(obj) = v.as_object() {
+            for (mint, j) in obj {
+                let Some(usd) = j["usdPrice"].as_f64() else { continue };
+                out.insert(mint.clone(), JupPrice { usd, liquidity: j["liquidity"].as_f64(), underlying: j["stockData"]["price"].as_f64(), underlying_mcap: j["stockData"]["mcap"].as_f64() });
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    out
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +91,7 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool) -> Result<usize> {
     let mints: Vec<String> = sqlx::query_scalar("SELECT mint FROM stocks").fetch_all(db).await?;
     let c = client(); let now = chrono_now(); let mut updated = 0;
     let marks = prestocks_marks(&c).await;
+    let jup = jupiter_prices(&c, &mints).await;
     for chunk in mints.chunks(30) {
         let url = format!("{DEXSCREENER}{}", chunk.join(","));
         let pairs: Vec<serde_json::Value> = match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
@@ -77,16 +102,21 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool) -> Result<usize> {
             // the stock is the base token in its own pools (vs SOL/USDC); pick the most liquid one
             let best = pairs.iter().filter(|p| p["baseToken"]["address"].as_str() == Some(mint))
                 .max_by(|a, b| a["liquidity"]["usd"].as_f64().unwrap_or(0.0).partial_cmp(&b["liquidity"]["usd"].as_f64().unwrap_or(0.0)).unwrap());
-            let Some(p) = best else { continue };
-            let Some(price) = p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()) else { continue };
+            let empty = serde_json::Value::Null;
+            let p = best.unwrap_or(&empty);
             let f = |v: &serde_json::Value| v.as_f64();
             let i = |v: &serde_json::Value| v.as_i64().map(|x| x as i32);
-            let (liq, v24, v1, b24, s24, mcap) = (f(&p["liquidity"]["usd"]), f(&p["volume"]["h24"]), f(&p["volume"]["h1"]), i(&p["txns"]["h24"]["buys"]), i(&p["txns"]["h24"]["sells"]), f(&p["marketCap"]).or(f(&p["fdv"])));
+            let j = jup.get(mint.as_str());
+            // price: Jupiter first (all pools), DexScreener's best pool as fallback
+            let Some(price) = j.map(|j| j.usd).or_else(|| p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok())) else { continue };
+            let liq = match (j.and_then(|j| j.liquidity), f(&p["liquidity"]["usd"])) { (Some(a), Some(b)) => Some(a.max(b)), (a, b) => a.or(b) };
+            let (v24, v1, b24, s24, mcap) = (f(&p["volume"]["h24"]), f(&p["volume"]["h1"]), i(&p["txns"]["h24"]["buys"]), i(&p["txns"]["h24"]["sells"]), f(&p["marketCap"]).or(f(&p["fdv"])));
             let (change, change_1h) = (f(&p["priceChange"]["h24"]), f(&p["priceChange"]["h1"]));
             let m = marks.get(mint.as_str());
-            let mark = m.and_then(|m| m.mark_price);
+            // mark = PreStocks' published mark for pre-IPO, else the real underlying stock price from Jupiter
+            let mark = m.and_then(|m| m.mark_price).or_else(|| j.and_then(|j| j.underlying));
             let premium = mark.filter(|m| *m > 0.0).map(|m| (price / m - 1.0) * 100.0);
-            let (mval, ival, supply) = (m.and_then(|m| m.mark_valuation), m.and_then(|m| m.implied_valuation), m.and_then(|m| m.supply));
+            let (mval, ival, supply) = (m.and_then(|m| m.mark_valuation).or_else(|| j.and_then(|j| j.underlying_mcap)), m.and_then(|m| m.implied_valuation), m.and_then(|m| m.supply));
             sqlx::query("UPDATE stocks SET price_usd=$2, change_24h=$3, updated_at=$4, liquidity_usd=$5, vol_24h_usd=$6, vol_1h_usd=$7, buys_24h=$8, sells_24h=$9, mcap_usd=$10, change_1h=$11, mark_usd=$12, premium_pct=$13, mark_valuation=$14, implied_valuation=$15, supply=$16 WHERE mint=$1")
                 .bind(mint).bind(price).bind(change).bind(now).bind(liq).bind(v24).bind(v1).bind(b24).bind(s24).bind(mcap).bind(change_1h).bind(mark).bind(premium).bind(mval).bind(ival).bind(supply)
                 .execute(db).await?;
