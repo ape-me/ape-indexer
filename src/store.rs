@@ -245,7 +245,9 @@ impl Store {
             "WITH todo AS (
                SELECT t.mint, t.creator, t.created_at, t.supply::float8 AS supply
                FROM tokens t JOIN token_stats ts ON ts.token_mint = t.mint
-               WHERE t.source = 'stream' AND t.supply IS NOT NULL AND t.supply > 0
+               -- 'stub' rows were created on their first trade (the create ix wasn't decoded) but our tape still
+               -- starts at birth, so holders are exact for them too. Only dev% needs the creator, null when unknown.
+               WHERE t.source IN ('stream', 'stub') AND t.supply IS NOT NULL AND t.supply > 0
                  AND ts.last_trade_at > $1 - 3600
                  AND (ts.holders_at IS NULL OR ts.holders_at < $1 - CASE WHEN ts.last_trade_at > $1 - 300 THEN 120 ELSE 600 END)
                ORDER BY ts.holders_at NULLS FIRST, ts.last_trade_at DESC LIMIT $2),
@@ -267,7 +269,7 @@ impl Store {
              UPDATE token_stats ts SET
                holders = COALESCE(agg.holders, 0),
                top10_pct = LEAST(100, COALESCE(top.top10, 0) / todo.supply * 100),
-               dev_pct = LEAST(100, COALESCE(agg.dev_bal, 0) / todo.supply * 100),
+               dev_pct = CASE WHEN todo.creator IS NULL THEN NULL ELSE LEAST(100, COALESCE(agg.dev_bal, 0) / todo.supply * 100) END,
                snipers_pct = LEAST(100, COALESCE(agg.sniper_bal, 0) / todo.supply * 100),
                holders_at = $1
              FROM todo LEFT JOIN agg ON agg.token_mint = todo.mint LEFT JOIN top ON top.token_mint = todo.mint
@@ -295,7 +297,7 @@ pub async fn rollup_loop(db: PgPool) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if last_fast.elapsed() > std::time::Duration::from_secs(15) { if let Err(e) = Store::rollup_fast(&db).await { tracing::warn!(%e, "rollup_fast") } last_fast = std::time::Instant::now(); }
-        if last_holders.elapsed() > std::time::Duration::from_secs(20) { match Store::rollup_holders(&db, 40).await { Ok(n) => tracing::debug!(n, "holders"), Err(e) => tracing::warn!(%e, "rollup_holders") } last_holders = std::time::Instant::now(); }
+        if last_holders.elapsed() > std::time::Duration::from_secs(20) { match Store::rollup_holders(&db, 60).await { Ok(n) => tracing::debug!(n, "holders"), Err(e) => tracing::warn!(%e, "rollup_holders") } last_holders = std::time::Instant::now(); }
         if last_rollup.elapsed() > std::time::Duration::from_secs(60) {
             let t = std::time::Instant::now();
             match Store::rollup(&db).await { Ok(n) => tracing::debug!(n, ms = t.elapsed().as_millis() as u64, "rollup"), Err(e) => tracing::warn!(%e, "rollup") }
