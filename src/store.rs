@@ -31,9 +31,9 @@ impl Store {
         Ok(s)
     }
 
-    /// Load dictionaries from Postgres. Cheap; called at start and every minute.
+    /// Load dictionaries from Postgres. Cheap; called at start and every minute. stock_usd is USD per raw unit.
     pub async fn reload(&mut self) -> Result<()> {
-        let rows: Vec<(String, i16, Option<f64>)> = sqlx::query_as("SELECT mint, decimals, price_usd * multiplier FROM stocks")   // USD per raw unit.fetch_all(&self.db).await?;
+        let rows: Vec<(String, i16, Option<f64>)> = sqlx::query_as("SELECT mint, decimals, price_usd * multiplier FROM stocks").fetch_all(&self.db).await?;
         self.stocks = rows.iter().map(|r| (r.0.clone(), r.1)).collect();
         self.stock_usd = rows.iter().filter_map(|r| r.2.map(|p| (r.0.clone(), p))).collect();
         let toks: Vec<(String, i16, String, Option<BigDecimal>)> = sqlx::query_as("SELECT mint, decimals, quote_mint, supply FROM tokens").fetch_all(&self.db).await?;
