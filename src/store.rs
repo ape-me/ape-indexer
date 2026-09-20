@@ -248,7 +248,7 @@ impl Store {
                -- 'stub' rows were created on their first trade (the create ix wasn't decoded) but our tape still
                -- starts at birth, so holders are exact for them too. Only dev% needs the creator, null when unknown.
                WHERE t.source IN ('stream', 'stub') AND t.supply IS NOT NULL AND t.supply > 0
-                 AND ts.last_trade_at > $1 - 3600
+                 AND ts.last_trade_at > $1 - 86400
                  AND (ts.holders_at IS NULL OR ts.holders_at < $1 - CASE WHEN ts.last_trade_at > $1 - 300 THEN 120 ELSE 600 END)
                ORDER BY ts.holders_at NULLS FIRST, ts.last_trade_at DESC LIMIT $2),
              pos AS (
