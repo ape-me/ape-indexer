@@ -142,7 +142,7 @@ impl Store {
     }
 
     /// 24h rollups for every token that traded recently. Runs once a minute.
-    pub async fn rollup(&self) -> Result<u64> {
+    pub async fn rollup(db: &PgPool) -> Result<u64> {
         let now = crate::stocks::chrono_now();
         let r = sqlx::query(
             "WITH w AS (
@@ -186,13 +186,13 @@ impl Store {
              LEFT JOIN p24 ON p24.token_mint = t.mint
              LEFT JOIN p1 ON p1.token_mint = t.mint
              WHERE ts.token_mint = t.mint AND (ts.last_trade_at > $1 - 90000 OR w.token_mint IS NOT NULL)")
-            .bind(now).execute(&self.db).await?;
-        self.rollup_stocks(now).await?;
+            .bind(now).execute(db).await?;
+        Self::rollup_stocks(db, now).await?;
         Ok(r.rows_affected())
     }
 
     /// Per-floor 24h numbers (launches, volume, wallets, heat, king). One statement, every 60s, read by /api/stocks.
-    async fn rollup_stocks(&self, now: i64) -> Result<()> {
+    async fn rollup_stocks(db: &PgPool, now: i64) -> Result<()> {
         sqlx::query(
             "WITH f AS (
                SELECT s.mint, COUNT(k.mint) FILTER (WHERE k.created_at > $1 - 86400)::int AS launched
@@ -214,12 +214,12 @@ impl Store {
              ON CONFLICT (mint) DO UPDATE SET launched_24h = EXCLUDED.launched_24h, meme_vol_24h = EXCLUDED.meme_vol_24h,
                trades_24h = EXCLUDED.trades_24h, wallets_24h = EXCLUDED.wallets_24h, heat = EXCLUDED.heat,
                king_mint = EXCLUDED.king_mint, updated_at = EXCLUDED.updated_at")
-            .bind(now).execute(&self.db).await?;
+            .bind(now).execute(db).await?;
         Ok(())
     }
 
     /// 5-minute window for tokens that traded in the last 6 minutes. Runs every 15s.
-    pub async fn rollup_fast(&self) -> Result<u64> {
+    pub async fn rollup_fast(db: &PgPool) -> Result<u64> {
         let now = crate::stocks::chrono_now();
         let r = sqlx::query(
             "WITH w AS (
@@ -232,14 +232,14 @@ impl Store {
              FROM tokens t JOIN stocks s ON s.mint = t.quote_mint
              LEFT JOIN w ON w.token_mint = t.mint
              WHERE ts.token_mint = t.mint AND (w.token_mint IS NOT NULL OR (ts.last_trade_at > $1 - 400 AND ts.vol_5m_usd > 0))")
-            .bind(now).execute(&self.db).await?;
+            .bind(now).execute(db).await?;
         Ok(r.rows_affected())
     }
 
     /// Holder analysis from our own tape: net position per wallet = buys - sells. Exact for tokens indexed since birth
     /// (source='stream'), ignores plain transfers. Pool/curve accounts never appear as wallets, so nothing to exclude.
     /// Snipers = wallets whose first buy landed within 10s of the token's creation.
-    pub async fn rollup_holders(&self, max_tokens: i64) -> Result<u64> {
+    pub async fn rollup_holders(db: &PgPool, max_tokens: i64) -> Result<u64> {
         let now = crate::stocks::chrono_now();
         let r = sqlx::query(
             "WITH todo AS (
@@ -272,7 +272,7 @@ impl Store {
                holders_at = $1
              FROM todo LEFT JOIN agg ON agg.token_mint = todo.mint LEFT JOIN top ON top.token_mint = todo.mint
              WHERE ts.token_mint = todo.mint")
-            .bind(now).bind(max_tokens).execute(&self.db).await?;
+            .bind(now).bind(max_tokens).execute(db).await?;
         Ok(r.rows_affected())
     }
 
@@ -285,5 +285,21 @@ impl Store {
     pub async fn load_cursor(&self) -> Result<Option<u64>> {
         let r: Option<(i64,)> = sqlx::query_as("SELECT last_slot FROM cursor WHERE program='stream'").fetch_optional(&self.db).await?;
         Ok(r.map(|x| x.0 as u64))
+    }
+}
+
+/// Stats rollups on their own task, so a 5s query never blocks the trade stream (it did: one lag spike a minute).
+/// fast: 15s · holders: 20s · 24h + per-floor: 60s. Runs never overlap because it's one sequential loop.
+pub async fn rollup_loop(db: PgPool) {
+    let (mut last_fast, mut last_holders, mut last_rollup) = (std::time::Instant::now(), std::time::Instant::now(), std::time::Instant::now());
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if last_fast.elapsed() > std::time::Duration::from_secs(15) { if let Err(e) = Store::rollup_fast(&db).await { tracing::warn!(%e, "rollup_fast") } last_fast = std::time::Instant::now(); }
+        if last_holders.elapsed() > std::time::Duration::from_secs(20) { match Store::rollup_holders(&db, 40).await { Ok(n) => tracing::debug!(n, "holders"), Err(e) => tracing::warn!(%e, "rollup_holders") } last_holders = std::time::Instant::now(); }
+        if last_rollup.elapsed() > std::time::Duration::from_secs(60) {
+            let t = std::time::Instant::now();
+            match Store::rollup(&db).await { Ok(n) => tracing::debug!(n, ms = t.elapsed().as_millis() as u64, "rollup"), Err(e) => tracing::warn!(%e, "rollup") }
+            last_rollup = std::time::Instant::now();
+        }
     }
 }

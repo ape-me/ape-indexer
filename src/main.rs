@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
             tokio::spawn(stocks::price_loop(db.clone()));
             tokio::spawn(enrich::run(db.clone()));
             tokio::spawn(enrich::dex_paid_loop(db.clone()));
+            tokio::spawn(store::rollup_loop(db.clone()));
             let push = match (std::env::var("INGEST_URL"), std::env::var("INGEST_SECRET")) { (Ok(u), Ok(k)) => Some((u, k)), _ => { tracing::warn!("INGEST_URL/INGEST_SECRET unset: live push disabled"); None } };
             let store = store::Store::open(db, push).await?;
             stream::run(store).await?;

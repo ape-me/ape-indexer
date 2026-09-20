@@ -51,7 +51,7 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
     let mut last_meta: Option<(u64, i64)> = None;
     let mut n_stocks = store.stocks.len();
     let mut last_stock_check = Instant::now();
-    let mut last_cursor = Instant::now(); let mut last_reload = Instant::now(); let mut last_rollup = Instant::now(); let mut last_fast = Instant::now(); let mut last_holders = Instant::now();
+    let mut last_cursor = Instant::now(); let mut last_reload = Instant::now(); 
     let mut n_tx = 0u64; let mut n_ev = 0u64; let mut last_log = Instant::now();
     // Transactions are held until the BlockMeta for their slot arrives (it follows the block's transactions),
     // so every trade carries the chain's exact block_time. A slot whose meta never shows up is flushed after
@@ -117,9 +117,6 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
                 if set.len() != n_stocks { n_stocks = set.len(); crate::metrics::stocks(n_stocks); tracing::info!(n = n_stocks, "stock list changed, resubscribing"); sink.send(request(set.into_iter().collect(), None)).await.ok(); }
             }
         }
-        if last_fast.elapsed() > Duration::from_secs(15) { if let Err(e) = store.rollup_fast().await { tracing::warn!(%e, "rollup_fast") } last_fast = Instant::now(); }
-        if last_holders.elapsed() > Duration::from_secs(20) { match store.rollup_holders(40).await { Ok(n) => tracing::debug!(n, "holders"), Err(e) => tracing::warn!(%e, "rollup_holders") } last_holders = Instant::now(); }
-        if last_rollup.elapsed() > Duration::from_secs(60) { match store.rollup().await { Ok(n) => tracing::debug!(n, "rollup"), Err(e) => tracing::warn!(%e, "rollup") } last_rollup = Instant::now(); }
         if last_log.elapsed() > Duration::from_secs(30) { tracing::info!(n_tx, n_ev, slot = last_slot, "stream"); n_tx = 0; n_ev = 0; last_log = Instant::now(); }
     }
     Ok(last_slot)
