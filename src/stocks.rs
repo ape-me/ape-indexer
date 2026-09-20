@@ -44,7 +44,33 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
         mints.insert(t.mint);
     }
     tracing::info!(n = mints.len(), "stocks synced");
+    if let Err(e) = refresh_multipliers(db).await { tracing::warn!(%e, "multipliers") }
     Ok(mints)
+}
+
+/// Token-2022 scaled-UI multiplier per stock. xStocks/Backpack pay dividends and do splits by raising it
+/// (1 raw unit = multiplier displayed units), so every raw→USD conversion must include it. A pending
+/// `newMultiplier` takes over once its effective time has passed. Mints without the extension stay at 1.
+pub async fn refresh_multipliers(db: &PgPool) -> Result<usize> {
+    let rpc = crate::enrich::Rpc::new();
+    let mints: Vec<String> = sqlx::query_scalar("SELECT mint FROM stocks").fetch_all(db).await?;
+    let now = chrono_now(); let mut n = 0;
+    for mint in mints {
+        let r = match rpc.call("getAccountInfo", serde_json::json!([mint, {"encoding":"jsonParsed"}])).await { Ok(r) => r, Err(e) => { tracing::warn!(%e, mint, "multiplier"); continue } };
+        let mut m = 1.0;
+        for ext in r["value"]["data"]["parsed"]["info"]["extensions"].as_array().cloned().unwrap_or_default() {
+            if ext["extension"].as_str() != Some("scaledUiAmountConfig") { continue }
+            let st = &ext["state"];
+            let cur = st["multiplier"].as_str().and_then(|x| x.parse::<f64>().ok()).or_else(|| st["multiplier"].as_f64()).unwrap_or(1.0);
+            let new = st["newMultiplier"].as_str().and_then(|x| x.parse::<f64>().ok()).or_else(|| st["newMultiplier"].as_f64());
+            let eff = st["newMultiplierEffectiveTimestamp"].as_i64().unwrap_or(i64::MAX);
+            m = match new { Some(nm) if eff <= now && nm > 0.0 => nm, _ => cur };
+        }
+        if m > 0.0 { sqlx::query("UPDATE stocks SET multiplier = $2 WHERE mint = $1 AND multiplier IS DISTINCT FROM $2").bind(&mint).bind(m).execute(db).await?; n += 1; }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tracing::info!(n, "multipliers refreshed");
+    Ok(n)
 }
 
 const PRESTOCKS: &str = "https://prestocks.com/api/prestocks";

@@ -33,7 +33,7 @@ impl Store {
 
     /// Load dictionaries from Postgres. Cheap; called at start and every minute.
     pub async fn reload(&mut self) -> Result<()> {
-        let rows: Vec<(String, i16, Option<f64>)> = sqlx::query_as("SELECT mint, decimals, price_usd FROM stocks").fetch_all(&self.db).await?;
+        let rows: Vec<(String, i16, Option<f64>)> = sqlx::query_as("SELECT mint, decimals, price_usd * multiplier FROM stocks")   // USD per raw unit.fetch_all(&self.db).await?;
         self.stocks = rows.iter().map(|r| (r.0.clone(), r.1)).collect();
         self.stock_usd = rows.iter().filter_map(|r| r.2.map(|p| (r.0.clone(), p))).collect();
         let toks: Vec<(String, i16, String, Option<BigDecimal>)> = sqlx::query_as("SELECT mint, decimals, quote_mint, supply FROM tokens").fetch_all(&self.db).await?;
@@ -148,14 +148,14 @@ impl Store {
             "WITH w AS (
                -- USD at trade time (quote_usd), falling back to the stock's current price for rows without it
                SELECT tr.token_mint,
-                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, s.price_usd)) AS vol_usd,
+                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, (s.price_usd * s.multiplier))) AS vol_usd,
                       COUNT(*) FILTER (WHERE tr.side='buy') AS buys,
                       COUNT(*) FILTER (WHERE tr.side='sell') AS sells
                FROM trades tr JOIN tokens tk ON tk.mint = tr.token_mint JOIN stocks s ON s.mint = tk.quote_mint
                WHERE tr.block_time > $1 - 86400 GROUP BY tr.token_mint),
              w1 AS (
                SELECT tr.token_mint,
-                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, s.price_usd)) AS vol_usd,
+                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, (s.price_usd * s.multiplier))) AS vol_usd,
                       COUNT(*) FILTER (WHERE tr.side='buy') AS buys, COUNT(*) FILTER (WHERE tr.side='sell') AS sells
                FROM trades tr JOIN tokens tk ON tk.mint = tr.token_mint JOIN stocks s ON s.mint = tk.quote_mint
                WHERE tr.block_time > $1 - 3600 GROUP BY tr.token_mint),
@@ -177,8 +177,8 @@ impl Store {
                vol_1h_usd = COALESCE(w1.vol_usd, 0),
                buys_1h = COALESCE(w1.buys, 0), sells_1h = COALESCE(w1.sells, 0),
                change_1h = CASE WHEN p1.price_then > 0 THEN (ts.price_quote / p1.price_then - 1) * 100 END,
-               price_usd = ts.price_quote * s.price_usd,
-               mcap_usd = CASE WHEN t.supply IS NOT NULL THEN ts.price_quote * s.price_usd * t.supply::float8 / POWER(10, t.decimals) ELSE ts.mcap_usd END,
+               price_usd = ts.price_quote * (s.price_usd * s.multiplier),
+               mcap_usd = CASE WHEN t.supply IS NOT NULL THEN ts.price_quote * (s.price_usd * s.multiplier) * t.supply::float8 / POWER(10, t.decimals) ELSE ts.mcap_usd END,
                updated_at = $1
              FROM tokens t JOIN stocks s ON s.mint = t.quote_mint
              LEFT JOIN w ON w.token_mint = t.mint
@@ -199,7 +199,7 @@ impl Store {
                FROM stocks s LEFT JOIN tokens k ON k.quote_mint = s.mint GROUP BY s.mint),
              v AS (
                SELECT k.quote_mint AS mint,
-                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, s.price_usd)) AS vol,
+                      SUM(tr.quote_raw::float8 / POWER(10, s.decimals) * COALESCE(tr.quote_usd, (s.price_usd * s.multiplier))) AS vol,
                       COUNT(*)::int AS trades, COUNT(DISTINCT tr.wallet)::int AS wallets
                FROM trades tr JOIN tokens k ON k.mint = tr.token_mint JOIN stocks s ON s.mint = k.quote_mint
                WHERE tr.block_time > $1 - 86400 GROUP BY k.quote_mint),
@@ -227,7 +227,7 @@ impl Store {
                       COUNT(*) FILTER (WHERE side='buy') AS buys, COUNT(*) FILTER (WHERE side='sell') AS sells
                FROM trades WHERE block_time > $1 - 300 GROUP BY token_mint)
              UPDATE token_stats ts SET
-               vol_5m_usd = COALESCE(w.vol_q / POWER(10, s.decimals) * s.price_usd, 0),
+               vol_5m_usd = COALESCE(w.vol_q / POWER(10, s.decimals) * (s.price_usd * s.multiplier), 0),
                buys_5m = COALESCE(w.buys, 0), sells_5m = COALESCE(w.sells, 0)
              FROM tokens t JOIN stocks s ON s.mint = t.quote_mint
              LEFT JOIN w ON w.token_mint = t.mint
