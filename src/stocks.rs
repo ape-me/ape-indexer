@@ -2,16 +2,14 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const STONKFUN: &str = "https://www.stonkfun.xyz/api/quote-tokens";
 const DEXSCREENER: &str = "https://api.dexscreener.com/tokens/v1/solana/";
 const STOCK_CATEGORIES: [&str; 3] = ["xstock", "backpack", "prestock"];
 /// Non-PreStocks pre-IPO mints. Never indexed: PreStocks bounty disqualifies any project that integrates them.
-const EXCLUDED_MINTS: [&str; 1] = [
-    "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", // SPCXx (xStocks SpaceX)
-];
+// Exclusions live in stock_config (see migration 0009), not here: flipping a row needs no deploy.
 
 #[derive(Deserialize)]
 struct QuoteToken { #[serde(rename = "quoteMint")] mint: String, symbol: String, name: String, decimals: i16, #[serde(rename = "logoUrl")] logo: Option<String>, category: String }
@@ -35,13 +33,18 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     let list: QuoteList = client().get(STONKFUN).send().await?.error_for_status()?.json().await.context("stonkfun quote-tokens")?;
     let now = chrono_now();
     let mut mints = HashSet::new();
-    for t in list.tokens.into_iter().filter(|t| STOCK_CATEGORIES.contains(&t.category.as_str()) && !EXCLUDED_MINTS.contains(&t.mint.as_str())) {
+    // Operator overrides: excluded stocks are kept in the table (flagged) but never subscribed to.
+    let cfg: HashMap<String, (bool, Option<String>, Vec<String>)> = sqlx::query_as::<_, (String, bool, Option<String>, Vec<String>)>("SELECT mint, excluded, category, tags FROM stock_config")
+        .fetch_all(db).await?.into_iter().map(|r| (r.0, (r.1, r.2, r.3))).collect();
+    for t in list.tokens.into_iter().filter(|t| STOCK_CATEGORIES.contains(&t.category.as_str())) {
         let logo = t.logo.map(|l| if l.starts_with('/') { format!("https://www.stonkfun.xyz{l}") } else { l });
-        sqlx::query("INSERT INTO stocks (mint, symbol, name, issuer, category, decimals, logo, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                     ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, name=EXCLUDED.name, issuer=EXCLUDED.issuer, category=EXCLUDED.category, decimals=EXCLUDED.decimals, logo=EXCLUDED.logo")
-            .bind(&t.mint).bind(&t.symbol).bind(&t.name).bind(issuer(&t.category)).bind(category(&t.category, &t.symbol)).bind(t.decimals).bind(logo).bind(now)
+        let (excluded, cat_override, tags) = cfg.get(&t.mint).cloned().unwrap_or((false, None, vec![]));
+        let cat = cat_override.unwrap_or_else(|| category(&t.category, &t.symbol).to_string());
+        sqlx::query("INSERT INTO stocks (mint, symbol, name, issuer, category, decimals, logo, updated_at, excluded, tags) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                     ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, name=EXCLUDED.name, issuer=EXCLUDED.issuer, category=EXCLUDED.category, decimals=EXCLUDED.decimals, logo=EXCLUDED.logo, excluded=EXCLUDED.excluded, tags=EXCLUDED.tags")
+            .bind(&t.mint).bind(&t.symbol).bind(&t.name).bind(issuer(&t.category)).bind(&cat).bind(t.decimals).bind(logo).bind(now).bind(excluded).bind(&tags)
             .execute(db).await?;
-        mints.insert(t.mint);
+        if !excluded { mints.insert(t.mint); }
     }
     tracing::info!(n = mints.len(), "stocks synced");
     if let Err(e) = refresh_multipliers(db).await { tracing::warn!(%e, "multipliers") }
