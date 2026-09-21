@@ -11,3 +11,6 @@ CREATE TABLE IF NOT EXISTS stock_config (
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS excluded boolean NOT NULL DEFAULT false;
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}';
 GRANT SELECT ON stock_config TO apeme_ro;
+-- The API connects as apeme_ro; the admin route is its only write path.
+GRANT INSERT, UPDATE ON stock_config TO apeme_ro;
+GRANT UPDATE (excluded, tags, category) ON stocks TO apeme_ro;
