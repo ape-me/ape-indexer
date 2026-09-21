@@ -1,0 +1,1 @@
+ALTER TABLE swaps DROP COLUMN IF EXISTS msg_hash, DROP COLUMN IF EXISTS last_valid_block_height, DROP COLUMN IF EXISTS fee_raw, DROP COLUMN IF EXISTS symbol;
