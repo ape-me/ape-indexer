@@ -24,11 +24,16 @@ pub struct IngestToken {
     pub launchpad: &'static str, pub creator: Option<String>, pub created_at: i64, pub ts: i64,
 }
 
-pub enum Msg { Trade(IngestTrade), Token(IngestToken) }
+/// Stock price tick for the stock:<mint> room (hero price + chart without polling). One per stock per 5s at most.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestPrice { pub mint: String, pub ts: i64, pub price_usd: f64, pub mark_usd: Option<f64>, pub change_24h: Option<f64> }
+
+pub enum Msg { Trade(IngestTrade), Token(IngestToken), Price(IngestPrice) }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Batch<'a> { trades: &'a [IngestTrade], tokens: &'a [IngestToken], sent_at: i64 }
+struct Batch<'a> { trades: &'a [IngestTrade], tokens: &'a [IngestToken], prices: &'a [IngestPrice], sent_at: i64 }
 
 pub struct Pusher { tx: mpsc::UnboundedSender<Msg> }
 
@@ -41,6 +46,7 @@ impl Pusher {
     }
     pub fn send(&self, t: IngestTrade) { let _ = self.tx.send(Msg::Trade(t)); }
     pub fn send_token(&self, t: IngestToken) { let _ = self.tx.send(Msg::Token(t)); }
+    pub fn send_price(&self, p: IngestPrice) { let _ = self.tx.send(Msg::Price(p)); }
 }
 
 fn sign(secret: &str, body: &str) -> String {
@@ -51,16 +57,16 @@ fn sign(secret: &str, body: &str) -> String {
 
 async fn run(url: String, secret: String, mut rx: mpsc::UnboundedReceiver<Msg>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("client");
-    let mut buf: Vec<IngestTrade> = Vec::new(); let mut toks: Vec<IngestToken> = Vec::new();
+    let mut buf: Vec<IngestTrade> = Vec::new(); let mut toks: Vec<IngestToken> = Vec::new(); let mut prices: Vec<IngestPrice> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
-            m = rx.recv() => match m { Some(Msg::Trade(t)) => { buf.push(t); if buf.len() < 1000 { continue } } Some(Msg::Token(t)) => { toks.push(t); continue } None => return },
+            m = rx.recv() => match m { Some(Msg::Trade(t)) => { buf.push(t); if buf.len() < 1000 { continue } } Some(Msg::Token(t)) => { toks.push(t); continue } Some(Msg::Price(p)) => { prices.push(p); continue } None => return },
             _ = tick.tick() => {}
         }
-        if buf.is_empty() && toks.is_empty() { continue }
-        let trades: Vec<IngestTrade> = buf.drain(..).collect(); let tokens: Vec<IngestToken> = toks.drain(..).collect();
-        let body = serde_json::to_string(&Batch { trades: &trades, tokens: &tokens, sent_at: crate::stocks::chrono_now() }).expect("json");
+        if buf.is_empty() && toks.is_empty() && prices.is_empty() { continue }
+        let trades: Vec<IngestTrade> = buf.drain(..).collect(); let tokens: Vec<IngestToken> = toks.drain(..).collect(); let px: Vec<IngestPrice> = prices.drain(..).collect();
+        let body = serde_json::to_string(&Batch { trades: &trades, tokens: &tokens, prices: &px, sent_at: crate::stocks::chrono_now() }).expect("json");
         let sig = sign(&secret, &body);
         let mut ok = false; let t0 = std::time::Instant::now();
         for attempt in 0..3u32 {

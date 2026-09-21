@@ -176,4 +176,28 @@ pub async fn price_loop(db: PgPool) {
     }
 }
 
+/// Every 5s: Jupiter price for every stock → stock_ticks (24h retention) and a `price` frame to the stock's room.
+/// Only pushes when the price moved, so a quiet stock costs nothing. Feeds /history 5m/15m/1h and the live hero price.
+pub async fn tick_loop(db: PgPool, push: Option<crate::push::Pusher>) {
+    let c = client(); let mut last: HashMap<String, f64> = HashMap::new(); let mut pass: u64 = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let rows: Vec<(String, Option<f64>, Option<f64>)> = match sqlx::query_as("SELECT mint, mark_usd, change_24h FROM stocks WHERE NOT excluded").fetch_all(&db).await { Ok(r) => r, Err(e) => { tracing::warn!(%e, "ticks: stocks"); continue } };
+        let mints: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+        let jup = jupiter_prices(&c, &mints).await;
+        if jup.is_empty() { continue }
+        let now = chrono_now();
+        for (mint, mark, chg) in &rows {
+            let Some(j) = jup.get(mint) else { continue };
+            if let Err(e) = sqlx::query("INSERT INTO stock_ticks (mint, ts, price_usd) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(mint).bind(now).bind(j.usd).execute(&db).await { tracing::warn!(%e, "ticks: insert"); }
+            if last.get(mint).map_or(true, |p| (p - j.usd).abs() > f64::EPSILON) {
+                last.insert(mint.clone(), j.usd);
+                if let Some(p) = &push { p.send_price(crate::push::IngestPrice { mint: mint.clone(), ts: now, price_usd: j.usd, mark_usd: *mark, change_24h: *chg }); }
+            }
+        }
+        pass += 1;
+        if pass % 720 == 0 { if let Err(e) = sqlx::query("DELETE FROM stock_ticks WHERE ts < $1").bind(now - 86400).execute(&db).await { tracing::warn!(%e, "ticks: retention") } }
+    }
+}
+
 pub fn chrono_now() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 }
