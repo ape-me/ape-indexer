@@ -1,0 +1,1 @@
+ALTER TABLE swaps DROP COLUMN IF EXISTS signed_tx;

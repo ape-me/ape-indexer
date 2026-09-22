@@ -1,0 +1,1 @@
+ALTER TABLE swaps ADD COLUMN IF NOT EXISTS signed_tx text;
