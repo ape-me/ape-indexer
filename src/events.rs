@@ -17,7 +17,6 @@ impl Program {
             Program::Damm2 => "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
         }
     }
-    pub fn from_id(id: &str) -> Option<Program> { Program::ALL.into_iter().find(|p| p.id() == id) }
     pub fn name(self) -> &'static str {
         match self { Program::Launchlab => "launchlab", Program::Cpmm => "cpmm", Program::Pumpfun => "pumpfun", Program::Pumpswap => "pumpswap", Program::Dbc => "dbc", Program::Damm2 => "damm2" }
     }

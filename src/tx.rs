@@ -7,9 +7,6 @@ pub struct Ix {
     pub program: String,
     pub accounts: Vec<String>,
     pub data: Vec<u8>,
-    /// index of the outer instruction this belongs to
-    pub outer: u16,
-    pub inner: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,23 +32,22 @@ impl TxView {
         for side in ["writable", "readonly"] {
             if let Some(a) = meta["loadedAddresses"][side].as_array() { keys.extend(a.iter().map(|k| k.as_str().unwrap_or("").to_string())); }
         }
-        let mk = |ix: &Value, outer: u16, inner: bool| -> Ix {
+        let mk = |ix: &Value| -> Ix {
             let pi = ix["programIdIndex"].as_u64().unwrap_or(0) as usize;
             Ix {
                 program: keys.get(pi).cloned().unwrap_or_default(),
                 accounts: ix["accounts"].as_array().map(|a| a.iter().map(|i| keys.get(i.as_u64().unwrap_or(0) as usize).cloned().unwrap_or_default()).collect()).unwrap_or_default(),
                 data: bs58::decode(ix["data"].as_str().unwrap_or("")).into_vec().unwrap_or_default(),
-                outer, inner,
             }
         };
         let outer: Vec<&Value> = tx["message"]["instructions"].as_array().context("instructions")?.iter().collect();
         let inner = meta["innerInstructions"].as_array().cloned().unwrap_or_default();
         let mut ixs = Vec::new();
         for (i, ix) in outer.iter().enumerate() {
-            ixs.push(mk(ix, i as u16, false));
+            ixs.push(mk(ix));
             for grp in &inner {
                 if grp["index"].as_u64() == Some(i as u64) {
-                    for iix in grp["instructions"].as_array().unwrap_or(&vec![]) { ixs.push(mk(iix, i as u16, true)); }
+                    for iix in grp["instructions"].as_array().unwrap_or(&vec![]) { ixs.push(mk(iix)); }
                 }
             }
         }
@@ -78,10 +74,10 @@ impl TxView {
         let key = |i: usize| keys.get(i).cloned().unwrap_or_default();
         let mut ixs = Vec::new();
         for (i, ix) in msg.instructions.iter().enumerate() {
-            ixs.push(Ix { program: key(ix.program_id_index as usize), accounts: ix.accounts.iter().map(|a| key(*a as usize)).collect(), data: ix.data.clone(), outer: i as u16, inner: false });
+            ixs.push(Ix { program: key(ix.program_id_index as usize), accounts: ix.accounts.iter().map(|a| key(*a as usize)).collect(), data: ix.data.clone() });
             for grp in meta.inner_instructions.iter().filter(|g| g.index as usize == i) {
                 for iix in &grp.instructions {
-                    ixs.push(Ix { program: key(iix.program_id_index as usize), accounts: iix.accounts.iter().map(|a| key(*a as usize)).collect(), data: iix.data.clone(), outer: i as u16, inner: true });
+                    ixs.push(Ix { program: key(iix.program_id_index as usize), accounts: iix.accounts.iter().map(|a| key(*a as usize)).collect(), data: iix.data.clone() });
                 }
             }
         }

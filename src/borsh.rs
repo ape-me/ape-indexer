@@ -5,7 +5,6 @@ pub struct Reader<'a> { buf: &'a [u8], pos: usize }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
-    pub fn remaining(&self) -> usize { self.buf.len() - self.pos }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() { bail!("borsh: short read at {} need {}", self.pos, n); }
         let s = &self.buf[self.pos..self.pos + n]; self.pos += n; Ok(s)

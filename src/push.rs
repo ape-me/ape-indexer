@@ -27,7 +27,7 @@ pub struct IngestToken {
 /// Stock price tick for the stock:<mint> room (hero price + chart without polling). One per stock per 5s at most.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct IngestPrice { pub mint: String, pub ts: i64, pub price_usd: f64, pub mark_usd: Option<f64>, pub change_24h: Option<f64> }
+pub struct IngestPrice { pub mint: String, pub kind: &'static str, pub ts: i64, pub price_usd: f64, pub mark_usd: Option<f64>, pub change_24h: Option<f64> }
 
 pub enum Msg { Trade(IngestTrade), Token(IngestToken), Price(IngestPrice) }
 

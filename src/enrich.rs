@@ -17,10 +17,6 @@ impl Rpc {
         if let Some(e) = r.get("error") { anyhow::bail!("rpc {method}: {e}"); }
         Ok(r["result"].clone())
     }
-    pub async fn token_supply(&self, mint: &str) -> Result<(String, i16)> {
-        let r = self.call("getTokenSupply", json!([mint])).await?;
-        Ok((r["value"]["amount"].as_str().unwrap_or("0").to_string(), r["value"]["decimals"].as_i64().unwrap_or(6) as i16))
-    }
     /// Metaplex metadata PDA: name, symbol, uri. Token-2022 metadata extension is handled by the uri fallback later.
     pub async fn metadata(&self, mint: &str) -> Result<Option<(String, String, String)>> {
         let pda = metadata_pda(mint)?;

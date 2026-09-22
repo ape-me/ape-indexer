@@ -292,7 +292,19 @@ impl Store {
 
 /// Stats rollups on their own task, so a 5s query never blocks the trade stream (it did: one lag spike a minute).
 /// fast: 15s · holders: 20s · 24h + per-floor: 60s. Runs never overlap because it's one sequential loop.
-pub async fn rollup_loop(db: PgPool) {
+impl Store {
+    /// Price heartbeat for memes traded in the last hour, so wallet screens track the stock leg of the price.
+    async fn push_meme_prices(db: &PgPool, push: &crate::push::Pusher) -> Result<usize> {
+        let now = crate::stocks::chrono_now();
+        let rows: Vec<(String, f64, Option<f64>)> = sqlx::query_as("SELECT token_mint, price_usd, change_24h FROM token_stats WHERE last_trade_at > $1 - 3600 AND price_usd IS NOT NULL")
+            .bind(now).fetch_all(db).await?;
+        let n = rows.len();
+        for (mint, price_usd, change_24h) in rows { push.send_price(crate::push::IngestPrice { mint, kind: "meme", ts: now, price_usd, mark_usd: None, change_24h }); }
+        Ok(n)
+    }
+}
+
+pub async fn rollup_loop(db: PgPool, push: Option<crate::push::Pusher>) {
     let (mut last_fast, mut last_holders, mut last_rollup) = (std::time::Instant::now(), std::time::Instant::now(), std::time::Instant::now());
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -301,6 +313,7 @@ pub async fn rollup_loop(db: PgPool) {
         if last_rollup.elapsed() > std::time::Duration::from_secs(60) {
             let t = std::time::Instant::now();
             match Store::rollup(&db).await { Ok(n) => tracing::debug!(n, ms = t.elapsed().as_millis() as u64, "rollup"), Err(e) => tracing::warn!(%e, "rollup") }
+            if let Some(p) = &push { if let Err(e) = Store::push_meme_prices(&db, p).await { tracing::warn!(%e, "meme prices") } }
             last_rollup = std::time::Instant::now();
         }
     }

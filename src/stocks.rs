@@ -191,7 +191,7 @@ pub async fn tick_loop(db: PgPool, push: Option<crate::push::Pusher>) {
             let Some(j) = jup.get(mint) else { continue };
             if let Err(e) = sqlx::query("INSERT INTO stock_ticks (mint, ts, price_usd) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(mint).bind(now).bind(j.usd).execute(&db).await { tracing::warn!(%e, "ticks: insert"); }
             // Always push, even when unchanged: the frame doubles as a heartbeat so a fresh subscriber sees a price within 5s.
-            if let Some(p) = &push { p.send_price(crate::push::IngestPrice { mint: mint.clone(), ts: now, price_usd: j.usd, mark_usd: *mark, change_24h: *chg }); }
+            if let Some(p) = &push { p.send_price(crate::push::IngestPrice { mint: mint.clone(), kind: "stock", ts: now, price_usd: j.usd, mark_usd: *mark, change_24h: *chg }); }
         }
         pass += 1;
         if pass % 720 == 0 { if let Err(e) = sqlx::query("DELETE FROM stock_ticks WHERE ts < $1").bind(now - 86400).execute(&db).await { tracing::warn!(%e, "ticks: retention") } }
