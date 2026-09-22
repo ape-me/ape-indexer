@@ -1,0 +1,1 @@
+ALTER TABLE swaps DROP COLUMN IF EXISTS swap_usd, DROP COLUMN IF EXISTS rent_usd, DROP COLUMN IF EXISTS issuer_fee_usd;
