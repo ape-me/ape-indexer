@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS news_stocks;
+DROP TABLE IF EXISTS news;
