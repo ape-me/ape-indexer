@@ -214,8 +214,8 @@ const JUPITER_PRICE: &str = "https://lite-api.jup.ag/price/v3?ids=";
 /// DexScreener only sees the pools it lists (OPENAI was +48% off). `stockData` carries the underlying stock's
 /// real price for tokenized equities, which gives premium-to-underlying for xStocks/Backpack too.
 struct JupPrice { usd: f64, liquidity: Option<f64>, underlying: Option<f64>, underlying_mcap: Option<f64> }
-async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> std::collections::HashMap<String, JupPrice> {
-    let mut out = std::collections::HashMap::new();
+async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> HashMap<String, JupPrice> {
+    let mut out = HashMap::new();
     for chunk in mints.chunks(50) {
         let url = format!("{JUPITER_PRICE}{}", chunk.join(","));
         let v: serde_json::Value = match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
@@ -253,7 +253,9 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
         else { sqlx::query_scalar("SELECT mint FROM stocks WHERE coalesce(liquidity_usd, 0) > 0").fetch_all(db).await? };
     let c = client(); let now = chrono_now(); let mut updated = 0;
     let marks = prestocks_marks(&c).await;
-    let jup = jupiter_prices(&c, &mints).await;
+    // The catalog sweep only needs to learn which mints have a pool, and DexScreener says that. Jupiter is
+    // rate-limited at ~60 calls a minute and the tick loop already spends most of it; the sweep stays off it.
+    let jup = if all { HashMap::new() } else { jupiter_prices(&c, &mints).await };
     for chunk in mints.chunks(30) {
         let url = format!("{DEXSCREENER}{}", chunk.join(","));
         let pairs: Vec<serde_json::Value> = match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
