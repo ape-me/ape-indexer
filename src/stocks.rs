@@ -39,8 +39,8 @@ struct BackedPage { #[serde(rename = "hasNextPage")] has_next: bool }
 #[derive(Deserialize)]
 struct BackedList { nodes: Vec<BackedAsset>, page: BackedPage }
 
-async fn backed(c: &reqwest::Client) -> Vec<Asset> {
-    let mut out = Vec::new();
+async fn backed(c: &reqwest::Client) -> (Vec<Asset>, HashMap<String, String>) {
+    let (mut out, mut logos) = (Vec::new(), HashMap::new());
     for page in 1..=40 {
         let r: BackedList = match c.get(format!("{BACKED}?page={page}")).send().await.and_then(|r| r.error_for_status()) {
             Ok(r) => match r.json().await { Ok(v) => v, Err(e) => { tracing::warn!(%e, page, "backed decode"); break } },
@@ -48,15 +48,33 @@ async fn backed(c: &reqwest::Client) -> Vec<Asset> {
         };
         let more = r.page.has_next;
         for a in r.nodes {
-            let Some(d) = a.deployments.iter().find(|d| d.network == "Solana") else { continue };
             let underlying = a.underlying.clone().unwrap_or_else(|| a.symbol.trim_end_matches('x').to_string());
+            if let Some(l) = &a.logo { logos.insert(underlying.clone(), l.clone()); }
+            let Some(d) = a.deployments.iter().find(|d| d.network == "Solana") else { continue };
             let name = a.name.trim_end_matches(" xStock").to_string();
             out.push(Asset { mint: d.address.clone(), category: stock_or_etf(&name, &underlying), symbol: a.symbol, name, issuer: "xstocks", underlying, logo: a.logo, halted: a.halted.unwrap_or(false), tags: vec![] });
         }
         if !more { break }
     }
     tracing::info!(n = out.len(), "backed assets");
-    out
+    (out, logos)
+}
+
+/// iOS cannot decode SVG, and some token metadata points at HTML or text. Backpack serves SVG for most tickers, so
+/// each Backpack and PreStocks logo is checked and falls back to Backed's PNG, then Ondo's, for the same ticker.
+async fn is_bitmap(c: &reqwest::Client, url: &str) -> bool {
+    let Ok(r) = c.head(url).send().await else { return false };
+    r.status().is_success() && r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
+        .is_some_and(|t| t.starts_with("image/") && !t.contains("svg"))
+}
+
+async fn bitmap_logo(c: &reqwest::Client, a: &Asset, backed: &HashMap<String, String>) -> Option<String> {
+    let ondo = format!("https://cdn.ondo.finance/tokens/logos/{}on_160x160.png", a.underlying.to_lowercase());
+    for url in a.logo.iter().chain(backed.get(&a.underlying)).chain(std::iter::once(&ondo)) {
+        if is_bitmap(c, url).await { return Some(url.clone()) }
+    }
+    tracing::warn!(symbol = %a.symbol, "no bitmap logo");
+    None
 }
 
 // ── Backpack Securities: every `.US` asset with a Solana mint in the exchange's public asset list ──
@@ -139,9 +157,11 @@ fn seeds() -> Vec<Asset> {
 pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     let c = client();
     let marks = prestocks_marks(&c).await;
-    let mut assets = backed(&c).await;
-    assets.extend(backpack(&c).await);
-    assets.extend(prestocks(&marks));
+    let (mut assets, backed_logos) = backed(&c).await;
+    for mut a in backpack(&c).await.into_iter().chain(prestocks(&marks)) {
+        a.logo = bitmap_logo(&c, &a, &backed_logos).await;
+        assets.push(a);
+    }
     assets.extend(seeds());
     if assets.len() < 500 { anyhow::bail!("catalog came back with {} assets; a source is down, keeping the table as is", assets.len()) }
     let now = chrono_now();
@@ -155,7 +175,7 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
         let cat = cat_override.unwrap_or_else(|| a.category.to_string());
         // decimals are filled from the mint account in refresh_mint_meta; 0 only ever exists between the two.
         sqlx::query("INSERT INTO stocks (mint, symbol, name, issuer, category, decimals, logo, updated_at, excluded, tags, halted, underlying) VALUES ($1,$2,$3,$4,$5,0,$6,$7,$8,$9,$10,$11)
-                     ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, name=EXCLUDED.name, issuer=EXCLUDED.issuer, category=EXCLUDED.category, logo=COALESCE(EXCLUDED.logo, stocks.logo), excluded=EXCLUDED.excluded, tags=EXCLUDED.tags, halted=EXCLUDED.halted, underlying=EXCLUDED.underlying")
+                     ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, name=EXCLUDED.name, issuer=EXCLUDED.issuer, category=EXCLUDED.category, logo=EXCLUDED.logo, excluded=EXCLUDED.excluded, tags=EXCLUDED.tags, halted=EXCLUDED.halted, underlying=EXCLUDED.underlying")
             .bind(&a.mint).bind(&a.symbol).bind(&a.name).bind(a.issuer).bind(&cat).bind(&a.logo).bind(now).bind(excluded).bind(&tags).bind(a.halted).bind(&a.underlying)
             .execute(db).await?;
         if !excluded && matches!(a.issuer, "xstocks" | "backpack" | "prestocks") { watched.insert(a.mint); }
