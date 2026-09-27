@@ -1,6 +1,7 @@
 //! Asset dictionary. Tokenized stocks come from their issuers (Backed, Backpack, PreStocks), crypto majors and
 //! yield tokens from a hand-checked seed list. Everything prices and swaps the same way, so it all lives in `stocks`.
 use anyhow::Result;
+use futures::StreamExt;
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
@@ -158,10 +159,14 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     let c = client();
     let marks = prestocks_marks(&c).await;
     let (mut assets, backed_logos) = backed(&c).await;
-    for mut a in backpack(&c).await.into_iter().chain(prestocks(&marks)) {
-        a.logo = bitmap_logo(&c, &a, &backed_logos).await;
-        assets.push(a);
-    }
+    // Only rows that can reach the shelf get the HEAD round-trips: Backpack lists 1,100+ mints, a few dozen are liquid.
+    let liquid: HashSet<String> = sqlx::query_scalar("SELECT mint FROM stocks WHERE coalesce(liquidity_usd, 0) >= 1000")
+        .fetch_all(db).await?.into_iter().collect();
+    let (c, backed_logos, liquid) = (&c, &backed_logos, &liquid);
+    let checked: Vec<Asset> = futures::stream::iter(backpack(c).await.into_iter().chain(prestocks(&marks)))
+        .map(|mut a| async move { if liquid.contains(&a.mint) { a.logo = bitmap_logo(c, &a, backed_logos).await } a })
+        .buffer_unordered(8).collect().await;
+    assets.extend(checked);
     assets.extend(seeds());
     if assets.len() < 500 { anyhow::bail!("catalog came back with {} assets; a source is down, keeping the table as is", assets.len()) }
     let now = chrono_now();
