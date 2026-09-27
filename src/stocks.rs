@@ -1,4 +1,5 @@
-//! Stock dictionary: 85 real stock mints from StonkFun's quote list, USD prices from DexScreener every 30s.
+//! Stock dictionary: mints discovered from StonkFun's quote list, named by their issuer, USD prices from
+//! DexScreener every 30s.
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -6,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const STONKFUN: &str = "https://www.stonkfun.xyz/api/quote-tokens";
+const BACKED: &str = "https://api.backed.fi/api/v2/public/assets";
 const DEXSCREENER: &str = "https://api.dexscreener.com/tokens/v1/solana/";
 const STOCK_CATEGORIES: [&str; 3] = ["xstock", "backpack", "prestock"];
 /// Non-PreStocks pre-IPO mints. Never indexed: PreStocks bounty disqualifies any project that integrates them.
@@ -16,6 +18,41 @@ struct QuoteToken { #[serde(rename = "quoteMint")] mint: String, symbol: String,
 #[derive(Deserialize)]
 struct QuoteList { #[serde(rename = "quoteTokens")] tokens: Vec<QuoteToken> }
 
+#[derive(Deserialize)]
+struct BackedDeployment { address: String, network: String }
+#[derive(Deserialize)]
+struct BackedAsset {
+    symbol: String, name: String, logo: Option<String>,
+    #[serde(rename = "isTradingHalted")] halted: Option<bool>,
+    deployments: Vec<BackedDeployment>,
+}
+#[derive(Deserialize)]
+struct BackedPage { #[serde(rename = "hasNextPage")] has_next: bool }
+#[derive(Deserialize)]
+struct BackedList { nodes: Vec<BackedAsset>, page: BackedPage }
+
+/// Issuer metadata keyed by Solana mint. Empty when Backed is unreachable, which leaves the existing rows alone.
+struct BackedMeta { symbol: String, name: String, logo: Option<String>, halted: bool }
+async fn backed_meta(c: &reqwest::Client) -> HashMap<String, BackedMeta> {
+    let mut out = HashMap::new();
+    for page in 1..=40 {
+        let r: BackedList = match c.get(format!("{BACKED}?page={page}")).send().await.and_then(|r| r.error_for_status()) {
+            Ok(r) => match r.json().await { Ok(v) => v, Err(e) => { tracing::warn!(%e, page, "backed decode"); break } },
+            Err(e) => { tracing::warn!(%e, page, "backed fetch"); break }
+        };
+        let more = r.page.has_next;
+        for a in r.nodes {
+            let Some(d) = a.deployments.iter().find(|d| d.network == "Solana") else { continue };
+            out.insert(d.address.clone(), BackedMeta {
+                symbol: a.symbol, name: a.name, logo: a.logo, halted: a.halted.unwrap_or(false),
+            });
+        }
+        if !more { break }
+    }
+    tracing::info!(n = out.len(), "backed assets");
+    out
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::builder().user_agent("ape-indexer/0.1").timeout(Duration::from_secs(15)).build().unwrap()
 }
@@ -25,24 +62,34 @@ fn issuer(cat: &str) -> &'static str { match cat { "xstock" => "xstocks", "backp
 const CRYPTO: [&str; 12] = ["ARB", "CHIP", "DOGE", "INJ", "LINK", "PEPE", "TAO", "PEAQ", "PONS", "ROBOSTRATEGY", "PSG", "PENG"];
 fn category(cat: &str, symbol: &str) -> &'static str {
     if CRYPTO.contains(&symbol) { return "crypto" }
-    match cat { "prestock" => "preipo", _ => if symbol.ends_with('X') && ["SPY", "QQQ", "TQQQ", "GLD", "VTI", "IWM", "DIA"].iter().any(|e| symbol.starts_with(e)) { "etf" } else { "stock" } }
+    let up = symbol.to_ascii_uppercase();
+    match cat { "prestock" => "preipo", _ => if up.ends_with('X') && ["SPY", "QQQ", "TQQQ", "GLD", "VTI", "IWM", "DIA"].iter().any(|e| up.starts_with(e)) { "etf" } else { "stock" } }
 }
 
 /// Upsert the stock list. Returns the set of stock mints.
 pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
-    let list: QuoteList = client().get(STONKFUN).send().await?.error_for_status()?.json().await.context("stonkfun quote-tokens")?;
+    let c = client();
+    let list: QuoteList = c.get(STONKFUN).send().await?.error_for_status()?.json().await.context("stonkfun quote-tokens")?;
+    let backed = backed_meta(&c).await;
     let now = chrono_now();
     let mut mints = HashSet::new();
     // Operator overrides: excluded stocks are kept in the table (flagged) but never subscribed to.
     let cfg: HashMap<String, (bool, Option<String>, Vec<String>)> = sqlx::query_as::<_, (String, bool, Option<String>, Vec<String>)>("SELECT mint, excluded, category, tags FROM stock_config")
         .fetch_all(db).await?.into_iter().map(|r| (r.0, (r.1, r.2, r.3))).collect();
     for t in list.tokens.into_iter().filter(|t| STOCK_CATEGORIES.contains(&t.category.as_str())) {
-        let logo = t.logo.map(|l| if l.starts_with('/') { format!("https://www.stonkfun.xyz{l}") } else { l });
         let (excluded, cat_override, tags) = cfg.get(&t.mint).cloned().unwrap_or((false, None, vec![]));
+        // Categorise from the launchpad's symbol: it is what the CRYPTO and ETF lists were written against.
         let cat = cat_override.unwrap_or_else(|| category(&t.category, &t.symbol).to_string());
-        sqlx::query("INSERT INTO stocks (mint, symbol, name, issuer, category, decimals, logo, updated_at, excluded, tags) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                     ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, name=EXCLUDED.name, issuer=EXCLUDED.issuer, category=EXCLUDED.category, decimals=EXCLUDED.decimals, logo=EXCLUDED.logo, excluded=EXCLUDED.excluded, tags=EXCLUDED.tags")
-            .bind(&t.mint).bind(&t.symbol).bind(&t.name).bind(issuer(&t.category)).bind(&cat).bind(t.decimals).bind(logo).bind(now).bind(excluded).bind(&tags)
+        let b = backed.get(&t.mint);
+        let symbol = b.map_or(&t.symbol, |b| &b.symbol);
+        let name = b.map_or(&t.name, |b| &b.name);
+        let logo = b.and_then(|b| b.logo.clone()).or_else(|| {
+            t.logo.clone().map(|l| if l.starts_with('/') { format!("https://www.stonkfun.xyz{l}") } else { l })
+        });
+        sqlx::query("INSERT INTO stocks (mint, symbol, name, issuer, category, decimals, logo, updated_at, excluded, tags, halted) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                     ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, name=EXCLUDED.name, issuer=EXCLUDED.issuer, category=EXCLUDED.category, decimals=EXCLUDED.decimals, logo=EXCLUDED.logo, excluded=EXCLUDED.excluded, tags=EXCLUDED.tags, halted=EXCLUDED.halted")
+            .bind(&t.mint).bind(symbol).bind(name).bind(issuer(&t.category)).bind(&cat).bind(t.decimals).bind(logo).bind(now).bind(excluded).bind(&tags)
+            .bind(b.is_some_and(|b| b.halted))
             .execute(db).await?;
         if !excluded { mints.insert(t.mint); }
     }
