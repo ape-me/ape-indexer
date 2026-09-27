@@ -149,10 +149,12 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     assets.extend(backpack(&c).await);
     assets.extend(prestocks(&marks));
     assets.extend(seeds(&c).await);
+    if assets.len() < 500 { anyhow::bail!("catalog came back with {} assets; a source is down, keeping the table as is", assets.len()) }
     let now = chrono_now();
     let cfg: HashMap<String, (bool, Option<String>, Vec<String>)> = sqlx::query_as::<_, (String, bool, Option<String>, Vec<String>)>("SELECT mint, excluded, category, tags FROM stock_config")
         .fetch_all(db).await?.into_iter().map(|r| (r.0, (r.1, r.2, r.3))).collect();
     let mut watched = HashSet::new();
+    let assets_mints: Vec<String> = assets.iter().map(|a| a.mint.clone()).collect();
     for a in assets {
         let (excluded, cat_override, mut tags) = cfg.get(&a.mint).cloned().unwrap_or((false, None, vec![]));
         tags.extend(a.tags);
@@ -164,6 +166,9 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
             .execute(db).await?;
         if !excluded && matches!(a.issuer, "xstocks" | "backpack" | "prestocks") { watched.insert(a.mint); }
     }
+    // A row no issuer lists any more is hidden, not deleted: trades and orders still reference it.
+    let synced: Vec<&str> = assets_mints.iter().map(String::as_str).collect();
+    sqlx::query("UPDATE stocks SET excluded = true WHERE NOT excluded AND NOT (mint = ANY($1))").bind(&synced).execute(db).await?;
     tracing::info!(n = watched.len(), "stocks synced");
     if let Err(e) = refresh_mint_meta(db).await { tracing::warn!(%e, "mint meta") }
     Ok(watched)
