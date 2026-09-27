@@ -8,7 +8,6 @@ use std::time::Duration;
 
 const BACKED: &str = "https://api.backed.fi/api/v2/public/assets";
 const BACKPACK_ASSETS: &str = "https://api.backpack.exchange/api/v1/assets";
-const JUPITER_SEARCH: &str = "https://lite-api.jup.ag/tokens/v2/search?query=";
 const DEXSCREENER: &str = "https://api.dexscreener.com/tokens/v1/solana/";
 // Exclusions and category overrides live in stock_config (migration 0009): flipping a row needs no deploy.
 
@@ -92,52 +91,47 @@ fn prestocks(marks: &HashMap<String, PreStock>) -> Vec<Asset> {
 }
 
 // ── Crypto majors and yield tokens. Jupiter-verified and liquid, hand-checked: name search returns squatters
-// for half of these, so the mint is the source of truth. (mint, symbol, name, category, group, underlying) ──
-const SEEDS: [(&str, &str, &str, &str, &str, &str); 31] = [
-    ("So11111111111111111111111111111111111111112", "SOL", "Solana", "crypto", "majors", "SOL"),
-    ("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", "WBTC", "Wrapped BTC (Portal)", "crypto", "majors", "BTC"),
-    ("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", "cbBTC", "Coinbase Wrapped BTC", "crypto", "majors", "BTC"),
-    ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", "ETH", "Ether (Portal)", "crypto", "majors", "ETH"),
-    ("6UpQcMAb5xMzxc7ZfPaVMgx3KqsvKZdT5U718BzD5We2", "wXRP", "Wrapped XRP", "crypto", "majors", "XRP"),
-    ("9gP2kCy3wA1ctvYWQk75guqXuHfrEomqydHLtcTCqiLa", "BNB", "Binance Coin (Portal)", "crypto", "majors", "BNB"),
-    ("DoGEV7LASBkQbibMc5k5vKnTZoMg423GpJ5QtJEGfm7R", "DOGE", "Dogecoin", "crypto", "majors", "DOGE"),
-    ("cbLTC4T5NpzSUtQ7ekgEMZGaUPVJY1ko6BUikqa4gGf", "cbLTC", "Coinbase Wrapped LTC", "crypto", "majors", "LTC"),
-    ("avaxGHCq3T7hoxd73oY2KY9hJSTaeMibXvHy5KNzh5D", "AVAX", "Avalanche", "crypto", "l1", "AVAX"),
-    ("suifhC9gU1VbJAPYPTBkHJyyyStKGLLYPVDTmPoqbvA", "SUI", "Sui", "crypto", "l1", "SUI"),
-    ("3ZLekZYq2qkZiSpnSvabjit34tUkjSwD1JFuW9as9wBG", "wNEAR", "Wrapped NEAR", "crypto", "l1", "NEAR"),
-    ("98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g", "HYPE", "Hyperliquid", "crypto", "l1", "HYPE"),
-    ("taoC6xyv2v8tDLcev4uaGUgV4vdQsWJrGft2kcBRrBY", "TAO", "Bittensor", "crypto", "l1", "TAO"),
-    ("ARBzQTYDCW2KnVEjs1Mc81LekB1ibVFZKbSVmorkoT9d", "ARB", "Arbitrum", "crypto", "l1", "ARB"),
-    ("LinkhB3afbBKb2EQQu7s7umdZceV3wcvAUJhQAfQ23L", "LINK", "Chainlink", "crypto", "defi", "LINK"),
-    ("uniHfuPhEQSrtpzXpJZDCSq53yaejKKpNhFUiKoHKHV", "UNI", "Uniswap", "crypto", "defi", "UNI"),
-    ("AavE1kKKnesPw4MuRJmJ9jZs9QzEE8CPxQ3ViczUDfc1", "AAVE", "Aave", "crypto", "defi", "AAVE"),
-    ("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", "RAY", "Raydium", "crypto", "defi", "RAY"),
-    ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "JUP", "Jupiter", "crypto", "defi", "JUP"),
-    ("jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL", "JTO", "Jito", "crypto", "defi", "JTO"),
-    ("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", "PYTH", "Pyth Network", "crypto", "defi", "PYTH"),
-    ("PEPEqnuuCDbBC89p1u9vpnP1KQ2oj1xTcQBsjt9X55m", "PEPE", "Pepe", "crypto", "memes", "PEPE"),
-    ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "BONK", "Bonk", "crypto", "memes", "BONK"),
-    ("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", "WIF", "dogwifhat", "crypto", "memes", "WIF"),
-    ("2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv", "PENGU", "Pudgy Penguins", "crypto", "memes", "PENGU"),
-    ("6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN", "TRUMP", "Official Trump", "crypto", "memes", "TRUMP"),
-    ("rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof", "RENDER", "Render", "crypto", "solana", "RENDER"),
-    ("hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux", "HNT", "Helium", "crypto", "solana", "HNT"),
-    ("AvZZF1YaZDziPY2RCK4oJrRVrbN3mTD9NL24hPeaZeUj", "syrupUSDC", "Maple Syrup USDC", "earn", "earn", "syrupUSDC"),
-    ("DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT", "USDe", "Ethena USDe", "earn", "earn", "USDe"),
-    ("A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6", "USDY", "Ondo US Dollar Yield", "earn", "earn", "USDY"),
+// for half of these, so the mint is the source of truth; logos are PNGs (Jupiter serves SVGs iOS cannot decode).
+// (mint, symbol, name, category, group, underlying, logo) ──
+const SEEDS: [(&str, &str, &str, &str, &str, &str, &str); 31] = [
+    ("So11111111111111111111111111111111111111112", "SOL", "Solana", "crypto", "majors", "SOL", "https://coin-images.coingecko.com/coins/images/4128/large/solana.png"),
+    ("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", "WBTC", "Wrapped BTC (Portal)", "crypto", "majors", "BTC", "https://coin-images.coingecko.com/coins/images/7598/large/WBTCLOGO.png"),
+    ("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", "cbBTC", "Coinbase Wrapped BTC", "crypto", "majors", "BTC", "https://coin-images.coingecko.com/coins/images/40143/large/cbbtc.webp"),
+    ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", "ETH", "Ether (Portal)", "crypto", "majors", "ETH", "https://coin-images.coingecko.com/coins/images/279/large/ethereum.png"),
+    ("6UpQcMAb5xMzxc7ZfPaVMgx3KqsvKZdT5U718BzD5We2", "wXRP", "Wrapped XRP", "crypto", "majors", "XRP", "https://coin-images.coingecko.com/coins/images/44/large/xrp-symbol-white-128.png"),
+    ("9gP2kCy3wA1ctvYWQk75guqXuHfrEomqydHLtcTCqiLa", "BNB", "Binance Coin (Portal)", "crypto", "majors", "BNB", "https://coin-images.coingecko.com/coins/images/825/large/bnb-icon2_2x.png"),
+    ("DoGEV7LASBkQbibMc5k5vKnTZoMg423GpJ5QtJEGfm7R", "DOGE", "Dogecoin", "crypto", "majors", "DOGE", "https://coin-images.coingecko.com/coins/images/5/large/dogecoin.png"),
+    ("cbLTC4T5NpzSUtQ7ekgEMZGaUPVJY1ko6BUikqa4gGf", "cbLTC", "Coinbase Wrapped LTC", "crypto", "majors", "LTC", "https://coin-images.coingecko.com/coins/images/2/large/litecoin.png"),
+    ("avaxGHCq3T7hoxd73oY2KY9hJSTaeMibXvHy5KNzh5D", "AVAX", "Avalanche", "crypto", "l1", "AVAX", "https://coin-images.coingecko.com/coins/images/12559/large/Avalanche_Circle_RedWhite_Trans.png"),
+    ("suifhC9gU1VbJAPYPTBkHJyyyStKGLLYPVDTmPoqbvA", "SUI", "Sui", "crypto", "l1", "SUI", "https://coin-images.coingecko.com/coins/images/26375/large/sui-ocean-square.png"),
+    ("3ZLekZYq2qkZiSpnSvabjit34tUkjSwD1JFuW9as9wBG", "wNEAR", "Wrapped NEAR", "crypto", "l1", "NEAR", "https://coin-images.coingecko.com/coins/images/10365/large/near.jpg"),
+    ("98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g", "HYPE", "Hyperliquid", "crypto", "l1", "HYPE", "https://coin-images.coingecko.com/coins/images/50882/large/hyperliquid.jpg"),
+    ("taoC6xyv2v8tDLcev4uaGUgV4vdQsWJrGft2kcBRrBY", "TAO", "Bittensor", "crypto", "l1", "TAO", "https://coin-images.coingecko.com/coins/images/28452/large/ARUsPeNQ_400x400.jpeg"),
+    ("ARBzQTYDCW2KnVEjs1Mc81LekB1ibVFZKbSVmorkoT9d", "ARB", "Arbitrum", "crypto", "l1", "ARB", "https://coin-images.coingecko.com/coins/images/16547/large/arb.jpg"),
+    ("LinkhB3afbBKb2EQQu7s7umdZceV3wcvAUJhQAfQ23L", "LINK", "Chainlink", "crypto", "defi", "LINK", "https://coin-images.coingecko.com/coins/images/877/large/Chainlink_Logo_500.png"),
+    ("uniHfuPhEQSrtpzXpJZDCSq53yaejKKpNhFUiKoHKHV", "UNI", "Uniswap", "crypto", "defi", "UNI", "https://coin-images.coingecko.com/coins/images/12504/large/uniswap-logo.png"),
+    ("AavE1kKKnesPw4MuRJmJ9jZs9QzEE8CPxQ3ViczUDfc1", "AAVE", "Aave", "crypto", "defi", "AAVE", "https://coin-images.coingecko.com/coins/images/12645/large/aave-token-round.png"),
+    ("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", "RAY", "Raydium", "crypto", "defi", "RAY", "https://coin-images.coingecko.com/coins/images/13928/large/PSigc4ie_400x400.jpg"),
+    ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "JUP", "Jupiter", "crypto", "defi", "JUP", "https://coin-images.coingecko.com/coins/images/34188/large/jup.png"),
+    ("jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL", "JTO", "Jito", "crypto", "defi", "JTO", "https://coin-images.coingecko.com/coins/images/33228/large/jto.png"),
+    ("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", "PYTH", "Pyth Network", "crypto", "defi", "PYTH", "https://coin-images.coingecko.com/coins/images/31924/large/pyth.png"),
+    ("PEPEqnuuCDbBC89p1u9vpnP1KQ2oj1xTcQBsjt9X55m", "PEPE", "Pepe", "crypto", "memes", "PEPE", "https://coin-images.coingecko.com/coins/images/29850/large/pepe-token.jpeg"),
+    ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "BONK", "Bonk", "crypto", "memes", "BONK", "https://coin-images.coingecko.com/coins/images/28600/large/bonk.jpg"),
+    ("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", "WIF", "dogwifhat", "crypto", "memes", "WIF", "https://coin-images.coingecko.com/coins/images/33566/large/dogwifhat.jpg"),
+    ("2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv", "PENGU", "Pudgy Penguins", "crypto", "memes", "PENGU", "https://coin-images.coingecko.com/coins/images/52622/large/PUDGY_PENGUINS_PENGU_PFP.png"),
+    ("6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN", "TRUMP", "Official Trump", "crypto", "memes", "TRUMP", "https://coin-images.coingecko.com/coins/images/53746/large/trump.png"),
+    ("rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof", "RENDER", "Render", "crypto", "solana", "RENDER", "https://coin-images.coingecko.com/coins/images/11636/large/rndr.png"),
+    ("hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux", "HNT", "Helium", "crypto", "solana", "HNT", "https://coin-images.coingecko.com/coins/images/4284/large/helium_logo_use.png"),
+    ("AvZZF1YaZDziPY2RCK4oJrRVrbN3mTD9NL24hPeaZeUj", "syrupUSDC", "Maple Syrup USDC", "earn", "earn", "syrupUSDC", "https://coin-images.coingecko.com/coins/images/54658/large/syrupUSDC.png"),
+    ("DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT", "USDe", "Ethena USDe", "earn", "earn", "USDe", "https://coin-images.coingecko.com/coins/images/33613/large/usde.png"),
+    ("A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6", "USDY", "Ondo US Dollar Yield", "earn", "earn", "USDY", "https://coin-images.coingecko.com/coins/images/31700/large/usdy_%281%29.png"),
 ];
 
-/// Logos for the seeds come from Jupiter's token search by mint; the upsert keeps an existing logo on a miss.
-async fn seeds(c: &reqwest::Client) -> Vec<Asset> {
-    let mut out = Vec::with_capacity(SEEDS.len());
-    for (mint, symbol, name, category, group, underlying) in SEEDS {
-        let logo = c.get(format!("{JUPITER_SEARCH}{mint}")).send().await.ok()
-            .and_then(|r| r.error_for_status().ok());
-        let logo = match logo { Some(r) => r.json::<Vec<serde_json::Value>>().await.ok().and_then(|v| v.into_iter().find(|t| t["id"] == mint).and_then(|t| t["icon"].as_str().map(String::from))), None => None };
-        out.push(Asset { mint: mint.into(), symbol: symbol.into(), name: name.into(), issuer: if category == "earn" { "earn" } else { "crypto" }, category, underlying: underlying.into(), logo, halted: false, tags: vec![group.to_string()] });
-        tokio::time::sleep(Duration::from_millis(120)).await;
-    }
-    out
+fn seeds() -> Vec<Asset> {
+    SEEDS.iter().map(|&(mint, symbol, name, category, group, underlying, logo)| Asset {
+        mint: mint.into(), symbol: symbol.into(), name: name.into(), issuer: if category == "earn" { "earn" } else { "crypto" },
+        category, underlying: underlying.into(), logo: Some(logo.into()), halted: false, tags: vec![group.to_string()],
+    }).collect()
 }
 
 /// Upsert the whole catalog. Returns the tokenized-stock mints the stream watches as quote tokens: crypto and
@@ -148,7 +142,7 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     let mut assets = backed(&c).await;
     assets.extend(backpack(&c).await);
     assets.extend(prestocks(&marks));
-    assets.extend(seeds(&c).await);
+    assets.extend(seeds());
     if assets.len() < 500 { anyhow::bail!("catalog came back with {} assets; a source is down, keeping the table as is", assets.len()) }
     let now = chrono_now();
     let cfg: HashMap<String, (bool, Option<String>, Vec<String>)> = sqlx::query_as::<_, (String, bool, Option<String>, Vec<String>)>("SELECT mint, excluded, category, tags FROM stock_config")
