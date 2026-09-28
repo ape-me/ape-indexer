@@ -27,10 +27,19 @@ pub async fn run(mut store: Store) -> Result<()> {
     let url = std::env::var("GRPC_URL")?; let token = std::env::var("API_KEY").ok();
     let mut from_slot = store.load_cursor().await?;
     if let Some(s) = from_slot { tracing::info!(slot = s, "resuming from cursor"); }
+    let mut quick_fails = 0u32;
     loop {
+        let started = Instant::now();
         match run_once(&mut store, &url, token.as_deref(), from_slot).await {
-            Ok(last) => { crate::metrics::stream_connected(false); crate::metrics::reconnect(); tracing::warn!("stream ended, reconnecting"); from_slot = last; }
-            Err(e) => { crate::metrics::stream_connected(false); crate::metrics::reconnect(); tracing::warn!(%e, "stream error, reconnecting in 2s"); from_slot = store.load_cursor().await.ok().flatten(); tokio::time::sleep(Duration::from_secs(2)).await; }
+            Ok(last) => { crate::metrics::stream_connected(false); crate::metrics::reconnect(); tracing::warn!("stream ended, reconnecting"); from_slot = last; quick_fails = 0; }
+            Err(e) => {
+                crate::metrics::stream_connected(false); crate::metrics::reconnect(); tracing::warn!(e = format!("{e:#}"), "stream error, reconnecting in 2s");
+                // A cursor older than the provider's replay window fails on the first recv, every time. Three of those in a
+                // row and we resume from the tip; the gap is backfill's job, a dead stream is nobody's.
+                quick_fails = if started.elapsed() < Duration::from_secs(10) { quick_fails + 1 } else { 0 };
+                from_slot = if quick_fails >= 3 { tracing::warn!("cursor too old for replay, resuming from the tip"); None } else { store.load_cursor().await.ok().flatten() };
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
     }
 }
