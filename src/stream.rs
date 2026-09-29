@@ -5,7 +5,7 @@ use crate::store::Store;
 use crate::tx::TxView;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateTransaction};
@@ -60,6 +60,7 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
     let mut last_meta: Option<(u64, i64)> = None;
     let mut n_stocks = store.stocks.len();
     let mut last_stock_check = Instant::now();
+    let mut sync: Option<tokio::task::JoinHandle<Option<HashSet<String>>>> = None;
     let mut last_cursor = Instant::now(); let mut last_reload = Instant::now(); 
     let mut n_tx = 0u64; let mut n_ev = 0u64; let mut last_log = Instant::now();
     // Transactions are held until the BlockMeta for their slot arrives (it follows the block's transactions),
@@ -120,9 +121,15 @@ async fn run_once(store: &mut Store, url: &str, token: Option<&str>, from_slot: 
         }
         if last_cursor.elapsed() > Duration::from_secs(5) { if let Some(s) = last_slot { store.save_cursor(s, last_sig.as_deref()).await.ok(); } last_cursor = Instant::now(); }
         if last_reload.elapsed() > Duration::from_secs(60) { store.reload().await.ok(); last_reload = Instant::now(); }
-        if last_stock_check.elapsed() > Duration::from_secs(600) {
+        // The catalog sync talks to three issuer APIs and upserts 2,000 rows; on this task it would stall the stream
+        // for ten seconds every ten minutes, so it runs beside it and the loop only picks up the result.
+        if last_stock_check.elapsed() > Duration::from_secs(600) && sync.is_none() {
             last_stock_check = Instant::now();
-            if let Ok(set) = crate::stocks::sync_list(&store.db).await { let _ = store.reload().await;
+            let db = store.db.clone();
+            sync = Some(tokio::spawn(async move { crate::stocks::sync_list(&db).await.ok() }));
+        }
+        if let Some(h) = sync.take_if(|h| h.is_finished()) {
+            if let Ok(Some(set)) = h.await { let _ = store.reload().await;
                 if set.len() != n_stocks { n_stocks = set.len(); crate::metrics::stocks(n_stocks); tracing::info!(n = n_stocks, "stock list changed, resubscribing"); sink.send(request(set.into_iter().collect(), None)).await.ok(); }
             }
         }
