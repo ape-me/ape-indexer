@@ -10,6 +10,10 @@ use std::time::Duration;
 const BACKED: &str = "https://api.backed.fi/api/v2/public/assets";
 const BACKPACK_ASSETS: &str = "https://api.backpack.exchange/api/v1/assets";
 const DEXSCREENER: &str = "https://api.dexscreener.com/tokens/v1/solana/";
+const JUP_VERIFIED: &str = "https://lite-api.jup.ag/tokens/v2/tag?query=verified";
+const ONDO_MINT_AUTHORITY: &str = "9foMHsSDq7nMg4WPusSz9eY7tyxyukqborA8GyU5cUxD";
+/// Ondo names that mint and redeem around the clock; everything else is Sunday 8pm to Friday 8pm ET.
+const ONDO_247: [&str; 31] = ["NVDA", "IBIT", "TSLA", "ORCL", "GOOGL", "MU", "DRAM", "STRC", "MSFT", "TSM", "AMZN", "MSTR", "SKHY", "CRCL", "TQQQ", "ETHA", "AAPL", "SNDK", "ARM", "SLV", "COIN", "MRVL", "AVGO", "META", "SPCX", "AMD", "GLD", "SPY", "INTC", "GLW", "QQQ"];
 // Exclusions and category overrides live in stock_config (migration 0009): flipping a row needs no deploy.
 
 fn client() -> reqwest::Client {
@@ -100,6 +104,26 @@ async fn backpack(c: &reqwest::Client) -> Vec<Asset> {
     out
 }
 
+// ── Ondo: their own feed sits behind a browser challenge, but every Ondo mint is on Jupiter's verified list
+// under one mint authority, with a PNG logo on Ondo's CDN. Trades go through Jupiter's RFQ, not pools. ──
+#[derive(Deserialize)]
+struct JupToken { id: String, name: String, symbol: String, icon: Option<String>, #[serde(rename = "mintAuthority")] mint_authority: Option<String> }
+
+async fn ondo(c: &reqwest::Client) -> Vec<Asset> {
+    let list: Vec<JupToken> = match c.get(JUP_VERIFIED).send().await.and_then(|r| r.error_for_status()) {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(e) => { tracing::warn!(%e, "jupiter verified list"); return vec![] }
+    };
+    let out: Vec<Asset> = list.into_iter().filter(|t| t.mint_authority.as_deref() == Some(ONDO_MINT_AUTHORITY)).filter_map(|t| {
+        let under = t.symbol.strip_suffix("on")?.to_string();
+        let name = t.name.trim_end_matches(" (Ondo Tokenized)").to_string();
+        let tags = if ONDO_247.contains(&under.as_str()) { vec!["247".to_string()] } else { vec![] };
+        Some(Asset { mint: t.id, category: stock_or_etf(&name, &under), symbol: t.symbol, name, issuer: "ondo", underlying: under, logo: t.icon, halted: false, tags })
+    }).collect();
+    tracing::info!(n = out.len(), "ondo assets");
+    out
+}
+
 // ── PreStocks: their own API is both the catalog and the mark feed ──
 fn prestocks(marks: &HashMap<String, PreStock>) -> Vec<Asset> {
     marks.values().filter_map(|p| {
@@ -167,6 +191,7 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
         .map(|mut a| async move { if liquid.contains(&a.mint) { a.logo = bitmap_logo(c, &a, backed_logos).await } a })
         .buffer_unordered(8).collect().await;
     assets.extend(checked);
+    assets.extend(ondo(&c).await);
     assets.extend(seeds());
     if assets.len() < 500 { anyhow::bail!("catalog came back with {} assets; a source is down, keeping the table as is", assets.len()) }
     let now = chrono_now();
@@ -232,7 +257,7 @@ const JUPITER_PRICE: &str = "https://lite-api.jup.ag/price/v3?ids=";
 /// Jupiter's aggregated price per mint: routes across every pool, so it is what a buyer actually pays.
 /// DexScreener only sees the pools it lists (OPENAI was +48% off). `stockData` carries the underlying stock's
 /// real price for tokenized equities, which gives premium-to-underlying for xStocks/Backpack too.
-struct JupPrice { usd: f64, liquidity: Option<f64>, underlying: Option<f64>, underlying_mcap: Option<f64> }
+struct JupPrice { usd: f64, liquidity: Option<f64>, change_24h: Option<f64>, underlying: Option<f64>, underlying_mcap: Option<f64> }
 async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> HashMap<String, JupPrice> {
     let mut out = HashMap::new();
     for chunk in mints.chunks(50) {
@@ -244,7 +269,7 @@ async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> HashMap<String
         if let Some(obj) = v.as_object() {
             for (mint, j) in obj {
                 let Some(usd) = j["usdPrice"].as_f64() else { continue };
-                out.insert(mint.clone(), JupPrice { usd, liquidity: j["liquidity"].as_f64(), underlying: j["stockData"]["price"].as_f64(), underlying_mcap: j["stockData"]["mcap"].as_f64() });
+                out.insert(mint.clone(), JupPrice { usd, liquidity: j["liquidity"].as_f64(), change_24h: j["priceChange24h"].as_f64(), underlying: j["stockData"]["price"].as_f64(), underlying_mcap: j["stockData"]["mcap"].as_f64() });
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -268,8 +293,8 @@ async fn prestocks_marks(c: &reqwest::Client) -> std::collections::HashMap<Strin
 /// Updates the live columns on `stocks`; with `snapshot` also appends a row per stock to `stock_snapshots`.
 /// `all` sweeps the whole catalog so a mint that just got its first pool is found; otherwise only pooled mints.
 pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<usize> {
-    let mints: Vec<String> = if all { sqlx::query_scalar("SELECT mint FROM stocks").fetch_all(db).await? }
-        else { sqlx::query_scalar("SELECT mint FROM stocks WHERE coalesce(liquidity_usd, 0) > 0").fetch_all(db).await? };
+    let mints: Vec<String> = if all { sqlx::query_scalar("SELECT mint FROM stocks WHERE issuer <> 'ondo'").fetch_all(db).await? }
+        else { sqlx::query_scalar("SELECT mint FROM stocks WHERE coalesce(liquidity_usd, 0) > 0 AND issuer <> 'ondo'").fetch_all(db).await? };
     let c = client(); let now = chrono_now(); let mut updated = 0;
     let marks = prestocks_marks(&c).await;
     // The catalog sweep only needs to learn which mints have a pool, and DexScreener says that. Jupiter is
@@ -315,13 +340,37 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
     Ok(updated)
 }
 
-/// Every 30s: live columns for pooled mints. Every other pass (60s): a snapshot row. Once an hour: the whole
-/// catalog, for pool discovery, and drop snapshots older than 30 days.
+/// Ondo names fill through Jupiter's RFQ, so DexScreener and the trade stream never see them. Jupiter's price feed
+/// carries the price, the thin pool liquidity, the 24h change and the underlying's mark. One pass = 9 calls.
+pub async fn refresh_ondo(db: &PgPool, c: &reqwest::Client, snapshot: bool) -> Result<usize> {
+    let mints: Vec<String> = sqlx::query_scalar("SELECT mint FROM stocks WHERE issuer = 'ondo' AND NOT excluded").fetch_all(db).await?;
+    if mints.is_empty() { return Ok(0) }
+    let jup = jupiter_prices(c, &mints).await;
+    let now = chrono_now();
+    for (mint, j) in &jup {
+        let premium = j.underlying.filter(|m| *m > 0.0).map(|m| (j.usd / m - 1.0) * 100.0);
+        sqlx::query("UPDATE stocks SET price_usd=$2, change_24h=$3, updated_at=$4, liquidity_usd=$5, mark_usd=$6, premium_pct=$7, mark_valuation=$8 WHERE mint=$1")
+            .bind(mint).bind(j.usd).bind(j.change_24h).bind(now).bind(j.liquidity).bind(j.underlying).bind(premium).bind(j.underlying_mcap).execute(db).await?;
+        sqlx::query("INSERT INTO stock_ticks (mint, ts, price_usd) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(mint).bind(now).bind(j.usd).execute(db).await?;
+        if snapshot {
+            sqlx::query("INSERT INTO stock_snapshots (mint, ts, price_usd, liquidity_usd, mark_usd, premium_pct, mark_valuation) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
+                .bind(mint).bind(now).bind(j.usd).bind(j.liquidity).bind(j.underlying).bind(premium).bind(j.underlying_mcap).execute(db).await?;
+        }
+    }
+    Ok(jup.len())
+}
+
+/// Every 30s: live columns for pooled mints. Every other pass (60s): a snapshot row and the Ondo pass. Once an
+/// hour: the whole catalog, for pool discovery, and drop snapshots older than 30 days.
 pub async fn price_loop(db: PgPool) {
+    let c = client();
     let mut pass: u64 = 0;
     loop {
         let last = std::time::Instant::now();
         match refresh_prices(&db, pass % 2 == 0, pass % 120 == 0).await { Ok(n) => { crate::metrics::stock_prices_refreshed(); tracing::info!(n, "stock prices refreshed") }, Err(e) => tracing::warn!(%e, "price loop") }
+        if pass % 2 == 0 {
+            match refresh_ondo(&db, &c, pass % 4 == 0).await { Ok(n) => tracing::info!(n, "ondo prices refreshed"), Err(e) => tracing::warn!(%e, "ondo prices") }
+        }
         if pass % 120 == 0 {
             let cutoff = chrono_now() - 30 * 86400;
             if let Err(e) = sqlx::query("DELETE FROM stock_snapshots WHERE ts < $1").bind(cutoff).execute(&db).await { tracing::warn!(%e, "snapshot retention") }
@@ -337,7 +386,7 @@ pub async fn tick_loop(db: PgPool, push: Option<crate::push::Pusher>) {
     let c = client(); let mut pass: u64 = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let rows: Vec<(String, Option<f64>, Option<f64>)> = match sqlx::query_as("SELECT mint, mark_usd, change_24h FROM stocks WHERE NOT excluded AND coalesce(liquidity_usd, 0) >= 1000").fetch_all(&db).await { Ok(r) => r, Err(e) => { tracing::warn!(%e, "ticks: stocks"); continue } };
+        let rows: Vec<(String, Option<f64>, Option<f64>)> = match sqlx::query_as("SELECT mint, mark_usd, change_24h FROM stocks WHERE NOT excluded AND coalesce(liquidity_usd, 0) >= 1000 AND issuer <> 'ondo'").fetch_all(&db).await { Ok(r) => r, Err(e) => { tracing::warn!(%e, "ticks: stocks"); continue } };
         let mints: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
         let jup = jupiter_prices(&c, &mints).await;
         if jup.is_empty() { continue }
