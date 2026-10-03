@@ -1,0 +1,1 @@
+ALTER TABLE swaps DROP COLUMN IF EXISTS expires_at;
