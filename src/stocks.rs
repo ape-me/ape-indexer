@@ -213,12 +213,32 @@ async fn top_coins(c: &reqwest::Client, list: &[JupToken], listed: &HashSet<Stri
             Asset { mint: t.id.clone(), symbol: t.symbol.clone(), name: t.name.clone(), issuer: "crypto", category: "crypto", underlying: under(t),
                     logo: t.icon.clone(), halted: false, tags: vec![group.to_string(), "top".to_string()] }
         }).collect();
-    // Jupiter serves some icons as SVG, which iOS cannot draw: those coins go without a logo.
-    let out: Vec<Asset> = futures::stream::iter(picked).map(|mut a| async move {
-        if let Some(u) = a.logo.take() { if is_bitmap(c, &u).await { a.logo = Some(u) } }
+    // Logos: DexScreener's CDN copy first; Jupiter's own icon is often an SVG (iOS cannot draw it) or sits on an IPFS
+    // gateway that rate-limits phones. No bitmap from either and the coin goes without one.
+    let mints: Vec<String> = picked.iter().map(|a| a.mint.clone()).collect();
+    let dex = dex_images(c, &mints).await;
+    let out: Vec<Asset> = futures::stream::iter(picked).map(|mut a| { let dex = &dex; async move {
+        let jup = a.logo.take().filter(|u| !u.contains("ipfs"));
+        for u in dex.get(&a.mint).into_iter().chain(jup.as_ref()) {
+            if is_bitmap(c, u).await { a.logo = Some(u.clone()); break }
+        }
         a
-    }).buffer_unordered(8).collect().await;
+    } }).buffer_unordered(8).collect().await;
     tracing::info!(n = out.len(), "top solana coins");
+    out
+}
+
+/// DexScreener's logo per mint (its token profile image, original file without resize params), 30 mints a call.
+async fn dex_images(c: &reqwest::Client, mints: &[String]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for chunk in mints.chunks(30) {
+        let Ok(r) = c.get(format!("{DEXSCREENER}{}", chunk.join(","))).send().await else { continue };
+        let pairs: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+        for p in pairs {
+            let (Some(mint), Some(img)) = (p["baseToken"]["address"].as_str(), p["info"]["imageUrl"].as_str()) else { continue };
+            out.entry(mint.to_string()).or_insert_with(|| img.split('?').next().unwrap_or(img).to_string());
+        }
+    }
     out
 }
 
