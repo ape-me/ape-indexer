@@ -304,10 +304,10 @@ async fn prestocks_marks(c: &reqwest::Client) -> std::collections::HashMap<Strin
     }
 }
 
-/// Our own last snapshot price per mint from `secs` ago (within the hour before it). 24h and 1h change come from
-/// this, not from DexScreener's single-pool figure, which once printed +4,876,972% on SK hynix.
+/// Our own median price per mint over the hour around `secs` ago: one junk tick on a thin pool can't move it. 24h and
+/// 1h change come from this, not from DexScreener's single-pool figure, which once printed +4,876,972% on SK hynix.
 async fn prices_ago(db: &PgPool, now: i64, secs: i64) -> HashMap<String, f64> {
-    sqlx::query_as::<_, (String, f64)>("SELECT DISTINCT ON (mint) mint, price_usd FROM stock_snapshots WHERE ts <= $1 AND ts > $1 - 3600 AND price_usd > 0 ORDER BY mint, ts DESC")
+    sqlx::query_as::<_, (String, f64)>("SELECT mint, percentile_cont(0.5) WITHIN GROUP (ORDER BY price_usd) FROM stock_snapshots WHERE ts > $1 - 1800 AND ts <= $1 + 1800 AND price_usd > 0 GROUP BY mint")
         .bind(now - secs).fetch_all(db).await.unwrap_or_default().into_iter().collect()
 }
 fn pct(now: f64, then: Option<&f64>) -> Option<f64> { then.map(|t| (now / t - 1.0) * 100.0) }
@@ -324,6 +324,7 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
     // rate-limited at ~60 calls a minute and the tick loop already spends most of it; the sweep stays off it.
     let jup = if all { HashMap::new() } else { jupiter_prices(&c, &mints).await };
     let (p24, p1) = (prices_ago(db, now, 86400).await, prices_ago(db, now, 3600).await);
+    let mult: HashMap<String, f64> = sqlx::query_as::<_, (String, f64)>("SELECT mint, multiplier FROM stocks WHERE multiplier > 0").fetch_all(db).await?.into_iter().collect();
     for chunk in mints.chunks(30) {
         let url = format!("{DEXSCREENER}{}", chunk.join(","));
         let pairs: Vec<serde_json::Value> = match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
@@ -339,8 +340,10 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
             let f = |v: &serde_json::Value| v.as_f64();
             let i = |v: &serde_json::Value| v.as_i64().map(|x| x as i32);
             let j = jup.get(mint.as_str());
-            // price: Jupiter first (all pools), DexScreener's best pool as fallback
-            let Some(price) = j.map(|j| j.usd).or_else(|| p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok())) else { continue };
+            // price: Jupiter first (all pools), DexScreener's best pool as fallback. DexScreener prices a raw token, which
+            // is `multiplier` shares after a split (NFLXx = 10), so it is brought back to one share.
+            let dex = p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()).map(|x| x / mult.get(mint).copied().unwrap_or(1.0));
+            let Some(price) = j.map(|j| j.usd).or(dex) else { continue };
             let liq = match (j.and_then(|j| j.liquidity), f(&p["liquidity"]["usd"])) { (Some(a), Some(b)) => Some(a.max(b)), (a, b) => a.or(b) };
             let (v24, v1, b24, s24, mcap) = (f(&p["volume"]["h24"]), f(&p["volume"]["h1"]), i(&p["txns"]["h24"]["buys"]), i(&p["txns"]["h24"]["sells"]), f(&p["marketCap"]).or(f(&p["fdv"])));
             let (change, change_1h) = (pct(price, p24.get(mint)), pct(price, p1.get(mint)));
