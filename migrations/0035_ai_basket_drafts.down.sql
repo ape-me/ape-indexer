@@ -1,0 +1,1 @@
+ALTER TABLE ai_baskets DROP COLUMN IF EXISTS saved_at;
