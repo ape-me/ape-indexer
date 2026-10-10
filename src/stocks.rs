@@ -74,7 +74,8 @@ async fn backed(c: &reqwest::Client) -> (Vec<Asset>, HashMap<String, String>, bo
 /// iOS cannot decode SVG, and some token metadata points at HTML or text. Backpack serves SVG for most tickers, so
 /// each Backpack and PreStocks logo is checked and falls back to Backed's PNG, then Ondo's, for the same ticker.
 async fn is_bitmap(c: &reqwest::Client, url: &str) -> bool {
-    let Ok(r) = c.head(url).send().await else { return false };
+    // A one-byte GET, not HEAD: some CDNs (DexScreener's) refuse HEAD.
+    let Ok(r) = c.get(url).header(reqwest::header::RANGE, "bytes=0-0").send().await else { return false };
     r.status().is_success() && r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
         .is_some_and(|t| t.starts_with("image/") && !t.contains("svg"))
 }
