@@ -367,8 +367,9 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
     Ok(updated)
 }
 
-/// Ondo names fill through Jupiter's RFQ, so DexScreener and the trade stream never see them. Jupiter's price feed
-/// carries the price, the thin pool liquidity and the underlying's mark. One pass = 9 calls.
+/// Ondo names fill through Jupiter's RFQ at the real share price, so DexScreener and the trade stream never see them,
+/// and Jupiter's own last price for them goes stale (MSFTon sat 32% over Microsoft for a day). The price shown is the
+/// underlying's, which is what the RFQ fills at; Jupiter's figure is the fallback when it has none. One pass = 9 calls.
 pub async fn refresh_ondo(db: &PgPool, c: &reqwest::Client, snapshot: bool) -> Result<usize> {
     let mints: Vec<String> = sqlx::query_scalar("SELECT mint FROM stocks WHERE issuer = 'ondo' AND NOT excluded").fetch_all(db).await?;
     if mints.is_empty() { return Ok(0) }
@@ -376,13 +377,13 @@ pub async fn refresh_ondo(db: &PgPool, c: &reqwest::Client, snapshot: bool) -> R
     let now = chrono_now();
     let p24 = prices_ago(db, now, 86400).await;
     for (mint, j) in &jup {
-        let premium = j.underlying.filter(|m| *m > 0.0).map(|m| (j.usd / m - 1.0) * 100.0);
-        sqlx::query("UPDATE stocks SET price_usd=$2, change_24h=$3, updated_at=$4, liquidity_usd=$5, mark_usd=$6, premium_pct=$7, mark_valuation=$8 WHERE mint=$1")
-            .bind(mint).bind(j.usd).bind(pct(j.usd, p24.get(mint))).bind(now).bind(j.liquidity).bind(j.underlying).bind(premium).bind(j.underlying_mcap).execute(db).await?;
-        sqlx::query("INSERT INTO stock_ticks (mint, ts, price_usd) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(mint).bind(now).bind(j.usd).execute(db).await?;
+        let price = j.underlying.filter(|m| *m > 0.0).unwrap_or(j.usd);
+        sqlx::query("UPDATE stocks SET price_usd=$2, change_24h=$3, updated_at=$4, liquidity_usd=$5, mark_usd=$6, premium_pct=NULL, mark_valuation=$7 WHERE mint=$1")
+            .bind(mint).bind(price).bind(pct(price, p24.get(mint))).bind(now).bind(j.liquidity).bind(j.underlying).bind(j.underlying_mcap).execute(db).await?;
+        sqlx::query("INSERT INTO stock_ticks (mint, ts, price_usd) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(mint).bind(now).bind(price).execute(db).await?;
         if snapshot {
-            sqlx::query("INSERT INTO stock_snapshots (mint, ts, price_usd, liquidity_usd, mark_usd, premium_pct, mark_valuation) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
-                .bind(mint).bind(now).bind(j.usd).bind(j.liquidity).bind(j.underlying).bind(premium).bind(j.underlying_mcap).execute(db).await?;
+            sqlx::query("INSERT INTO stock_snapshots (mint, ts, price_usd, liquidity_usd, mark_usd, mark_valuation) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
+                .bind(mint).bind(now).bind(price).bind(j.liquidity).bind(j.underlying).bind(j.underlying_mcap).execute(db).await?;
         }
     }
     Ok(jup.len())
