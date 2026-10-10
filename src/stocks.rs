@@ -345,6 +345,8 @@ pub async fn refresh_mint_meta(db: &PgPool) -> Result<usize> {
 
 const PRESTOCKS: &str = "https://prestocks.com/api/prestocks";
 const JUPITER_PRICE: &str = "https://lite-api.jup.ag/price/v3?ids=";
+// With a developers.jup.ag key: the free lite-api allows ~60 calls a minute, and the 5s tick loop alone needs about that.
+const JUPITER_PRICE_KEYED: &str = "https://api.jup.ag/price/v3?ids=";
 
 /// Jupiter's aggregated price per mint: routes across every pool, so it is what a buyer actually pays.
 /// DexScreener only sees the pools it lists (OPENAI was +48% off). `stockData` carries the underlying stock's
@@ -352,9 +354,11 @@ const JUPITER_PRICE: &str = "https://lite-api.jup.ag/price/v3?ids=";
 struct JupPrice { usd: f64, liquidity: Option<f64>, underlying: Option<f64>, underlying_mcap: Option<f64> }
 async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> HashMap<String, JupPrice> {
     let mut out = HashMap::new();
+    let key = std::env::var("JUP_API_KEY").ok().filter(|k| !k.is_empty());
     for chunk in mints.chunks(50) {
-        let url = format!("{JUPITER_PRICE}{}", chunk.join(","));
-        let v: serde_json::Value = match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
+        let url = format!("{}{}", if key.is_some() { JUPITER_PRICE_KEYED } else { JUPITER_PRICE }, chunk.join(","));
+        let req = match &key { Some(k) => c.get(&url).header("x-api-key", k), None => c.get(&url) };
+        let v: serde_json::Value = match req.send().await.and_then(|r| r.error_for_status()) {
             Ok(r) => r.json().await.unwrap_or_default(),
             Err(e) => { tracing::warn!(%e, "jupiter price"); continue }
         };
