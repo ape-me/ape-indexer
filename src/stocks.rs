@@ -490,12 +490,13 @@ pub async fn price_loop(db: PgPool) {
     }
 }
 
-/// Every 5s: Jupiter price for every stock → stock_ticks (24h retention) and a `price` frame to the stock's room.
+/// Every 10s: Jupiter price for every stock → stock_ticks (24h retention) and a `price` frame to the stock's room.
+/// 10s, not 5: ~200 mints is 5 calls a pass, and the free price API allows ~60 a minute across all our loops.
 /// Pushes every pass (heartbeat). Feeds /history 5m/15m/1h and the live hero price.
 pub async fn tick_loop(db: PgPool, push: Option<crate::push::Pusher>) {
     let c = client(); let mut pass: u64 = 0;
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
         let rows: Vec<(String, Option<f64>, Option<f64>)> = match sqlx::query_as("SELECT mint, mark_usd, change_24h FROM stocks WHERE NOT excluded AND coalesce(liquidity_usd, 0) >= 1000 AND issuer <> 'ondo'").fetch_all(&db).await { Ok(r) => r, Err(e) => { tracing::warn!(%e, "ticks: stocks"); continue } };
         let mints: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
         let jup = jupiter_prices(&c, &mints).await;
@@ -504,11 +505,11 @@ pub async fn tick_loop(db: PgPool, push: Option<crate::push::Pusher>) {
         for (mint, mark, chg) in &rows {
             let Some(j) = jup.get(mint) else { continue };
             if let Err(e) = sqlx::query("INSERT INTO stock_ticks (mint, ts, price_usd) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(mint).bind(now).bind(j.usd).execute(&db).await { tracing::warn!(%e, "ticks: insert"); }
-            // Always push, even when unchanged: the frame doubles as a heartbeat so a fresh subscriber sees a price within 5s.
+            // Always push, even when unchanged: the frame doubles as a heartbeat so a fresh subscriber sees a price within 10s.
             if let Some(p) = &push { p.send_price(crate::push::IngestPrice { mint: mint.clone(), kind: "stock", ts: now, price_usd: j.usd, mark_usd: *mark, change_24h: *chg }); }
         }
         pass += 1;
-        if pass % 720 == 0 { if let Err(e) = sqlx::query("DELETE FROM stock_ticks WHERE ts < $1").bind(now - 86400).execute(&db).await { tracing::warn!(%e, "ticks: retention") } }
+        if pass % 360 == 0 { if let Err(e) = sqlx::query("DELETE FROM stock_ticks WHERE ts < $1").bind(now - 86400).execute(&db).await { tracing::warn!(%e, "ticks: retention") } }
     }
 }
 
