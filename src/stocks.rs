@@ -44,13 +44,19 @@ struct BackedPage { #[serde(rename = "hasNextPage")] has_next: bool }
 #[derive(Deserialize)]
 struct BackedList { nodes: Vec<BackedAsset>, page: BackedPage }
 
-async fn backed(c: &reqwest::Client) -> (Vec<Asset>, HashMap<String, String>) {
+/// Also says whether every page came back: a partial list must not hide the xStocks it is missing.
+async fn backed(c: &reqwest::Client) -> (Vec<Asset>, HashMap<String, String>, bool) {
     let (mut out, mut logos) = (Vec::new(), HashMap::new());
     for page in 1..=40 {
-        let r: BackedList = match c.get(format!("{BACKED}?page={page}")).send().await.and_then(|r| r.error_for_status()) {
-            Ok(r) => match r.json().await { Ok(v) => v, Err(e) => { tracing::warn!(%e, page, "backed decode"); break } },
-            Err(e) => { tracing::warn!(%e, page, "backed fetch"); break }
-        };
+        let mut got = None;
+        for attempt in 0..3 {
+            if attempt > 0 { tokio::time::sleep(Duration::from_secs(2)).await }
+            match c.get(format!("{BACKED}?page={page}")).send().await.and_then(|r| r.error_for_status()) {
+                Ok(r) => match r.json::<BackedList>().await { Ok(v) => { got = Some(v); break } Err(e) => tracing::warn!(%e, page, "backed decode") },
+                Err(e) => tracing::warn!(%e, page, attempt, "backed fetch"),
+            }
+        }
+        let Some(r) = got else { return (out, logos, false) };
         let more = r.page.has_next;
         for a in r.nodes {
             let underlying = a.underlying.clone().unwrap_or_else(|| a.symbol.trim_end_matches('x').to_string());
@@ -62,7 +68,7 @@ async fn backed(c: &reqwest::Client) -> (Vec<Asset>, HashMap<String, String>) {
         if !more { break }
     }
     tracing::info!(n = out.len(), "backed assets");
-    (out, logos)
+    (out, logos, true)
 }
 
 /// iOS cannot decode SVG, and some token metadata points at HTML or text. Backpack serves SVG for most tickers, so
@@ -182,16 +188,24 @@ fn seeds() -> Vec<Asset> {
 pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     let c = client();
     let marks = prestocks_marks(&c).await;
-    let (mut assets, backed_logos) = backed(&c).await;
+    let (mut assets, backed_logos, backed_ok) = backed(&c).await;
     // Only rows that can reach the shelf get the HEAD round-trips: Backpack lists 1,100+ mints, a few dozen are liquid.
     let liquid: HashSet<String> = sqlx::query_scalar("SELECT mint FROM stocks WHERE coalesce(liquidity_usd, 0) >= 1000")
         .fetch_all(db).await?.into_iter().collect();
     let (c, backed_logos, liquid) = (&c, &backed_logos, &liquid);
-    let checked: Vec<Asset> = futures::stream::iter(backpack(c).await.into_iter().chain(prestocks(&marks)))
+    let backpack = backpack(c).await;
+    // A source that failed this run keeps its rows as they are instead of hiding them all.
+    let mut failed: Vec<&str> = vec![];
+    if !backed_ok { failed.push("xstocks") }
+    if backpack.is_empty() { failed.push("backpack") }
+    if marks.is_empty() { failed.push("prestocks") }
+    let checked: Vec<Asset> = futures::stream::iter(backpack.into_iter().chain(prestocks(&marks)))
         .map(|mut a| async move { if liquid.contains(&a.mint) { a.logo = bitmap_logo(c, &a, backed_logos).await } a })
         .buffer_unordered(8).collect().await;
     assets.extend(checked);
-    assets.extend(ondo(&c).await);
+    let ondo = ondo(c).await;
+    if ondo.is_empty() { failed.push("ondo") }
+    assets.extend(ondo);
     assets.extend(seeds());
     if assets.len() < 500 { anyhow::bail!("catalog came back with {} assets; a source is down, keeping the table as is", assets.len()) }
     let now = chrono_now();
@@ -212,7 +226,8 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
     }
     // A row no issuer lists any more is hidden, not deleted: trades and orders still reference it.
     let synced: Vec<&str> = assets_mints.iter().map(String::as_str).collect();
-    sqlx::query("UPDATE stocks SET excluded = true WHERE NOT excluded AND NOT (mint = ANY($1))").bind(&synced).execute(db).await?;
+    sqlx::query("UPDATE stocks SET excluded = true WHERE NOT excluded AND NOT (mint = ANY($1)) AND NOT (issuer = ANY($2))").bind(&synced).bind(&failed).execute(db).await?;
+    if !failed.is_empty() { tracing::warn!(?failed, "catalog sources failed; their rows kept as they were") }
     tracing::info!(n = watched.len(), "stocks synced");
     if let Err(e) = refresh_mint_meta(db).await { tracing::warn!(%e, "mint meta") }
     Ok(watched)
@@ -257,7 +272,7 @@ const JUPITER_PRICE: &str = "https://lite-api.jup.ag/price/v3?ids=";
 /// Jupiter's aggregated price per mint: routes across every pool, so it is what a buyer actually pays.
 /// DexScreener only sees the pools it lists (OPENAI was +48% off). `stockData` carries the underlying stock's
 /// real price for tokenized equities, which gives premium-to-underlying for xStocks/Backpack too.
-struct JupPrice { usd: f64, liquidity: Option<f64>, change_24h: Option<f64>, underlying: Option<f64>, underlying_mcap: Option<f64> }
+struct JupPrice { usd: f64, liquidity: Option<f64>, underlying: Option<f64>, underlying_mcap: Option<f64> }
 async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> HashMap<String, JupPrice> {
     let mut out = HashMap::new();
     for chunk in mints.chunks(50) {
@@ -269,7 +284,7 @@ async fn jupiter_prices(c: &reqwest::Client, mints: &[String]) -> HashMap<String
         if let Some(obj) = v.as_object() {
             for (mint, j) in obj {
                 let Some(usd) = j["usdPrice"].as_f64() else { continue };
-                out.insert(mint.clone(), JupPrice { usd, liquidity: j["liquidity"].as_f64(), change_24h: j["priceChange24h"].as_f64(), underlying: j["stockData"]["price"].as_f64(), underlying_mcap: j["stockData"]["mcap"].as_f64() });
+                out.insert(mint.clone(), JupPrice { usd, liquidity: j["liquidity"].as_f64(), underlying: j["stockData"]["price"].as_f64(), underlying_mcap: j["stockData"]["mcap"].as_f64() });
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -289,6 +304,14 @@ async fn prestocks_marks(c: &reqwest::Client) -> std::collections::HashMap<Strin
     }
 }
 
+/// Our own last snapshot price per mint from `secs` ago (within the hour before it). 24h and 1h change come from
+/// this, not from DexScreener's single-pool figure, which once printed +4,876,972% on SK hynix.
+async fn prices_ago(db: &PgPool, now: i64, secs: i64) -> HashMap<String, f64> {
+    sqlx::query_as::<_, (String, f64)>("SELECT DISTINCT ON (mint) mint, price_usd FROM stock_snapshots WHERE ts <= $1 AND ts > $1 - 3600 AND price_usd > 0 ORDER BY mint, ts DESC")
+        .bind(now - secs).fetch_all(db).await.unwrap_or_default().into_iter().collect()
+}
+fn pct(now: f64, then: Option<&f64>) -> Option<f64> { then.map(|t| (now / t - 1.0) * 100.0) }
+
 /// One pass of market data: 30 mints per DexScreener call, best pair by liquidity, plus PreStocks marks.
 /// Updates the live columns on `stocks`; with `snapshot` also appends a row per stock to `stock_snapshots`.
 /// `all` sweeps the whole catalog so a mint that just got its first pool is found; otherwise only pooled mints.
@@ -300,6 +323,7 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
     // The catalog sweep only needs to learn which mints have a pool, and DexScreener says that. Jupiter is
     // rate-limited at ~60 calls a minute and the tick loop already spends most of it; the sweep stays off it.
     let jup = if all { HashMap::new() } else { jupiter_prices(&c, &mints).await };
+    let (p24, p1) = (prices_ago(db, now, 86400).await, prices_ago(db, now, 3600).await);
     for chunk in mints.chunks(30) {
         let url = format!("{DEXSCREENER}{}", chunk.join(","));
         let pairs: Vec<serde_json::Value> = match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
@@ -319,7 +343,7 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
             let Some(price) = j.map(|j| j.usd).or_else(|| p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok())) else { continue };
             let liq = match (j.and_then(|j| j.liquidity), f(&p["liquidity"]["usd"])) { (Some(a), Some(b)) => Some(a.max(b)), (a, b) => a.or(b) };
             let (v24, v1, b24, s24, mcap) = (f(&p["volume"]["h24"]), f(&p["volume"]["h1"]), i(&p["txns"]["h24"]["buys"]), i(&p["txns"]["h24"]["sells"]), f(&p["marketCap"]).or(f(&p["fdv"])));
-            let (change, change_1h) = (f(&p["priceChange"]["h24"]), f(&p["priceChange"]["h1"]));
+            let (change, change_1h) = (pct(price, p24.get(mint)), pct(price, p1.get(mint)));
             let m = marks.get(mint.as_str());
             // mark = PreStocks' published mark for pre-IPO, else the real underlying stock price from Jupiter
             let mark = m.and_then(|m| m.mark_price).or_else(|| j.and_then(|j| j.underlying));
@@ -341,16 +365,17 @@ pub async fn refresh_prices(db: &PgPool, snapshot: bool, all: bool) -> Result<us
 }
 
 /// Ondo names fill through Jupiter's RFQ, so DexScreener and the trade stream never see them. Jupiter's price feed
-/// carries the price, the thin pool liquidity, the 24h change and the underlying's mark. One pass = 9 calls.
+/// carries the price, the thin pool liquidity and the underlying's mark. One pass = 9 calls.
 pub async fn refresh_ondo(db: &PgPool, c: &reqwest::Client, snapshot: bool) -> Result<usize> {
     let mints: Vec<String> = sqlx::query_scalar("SELECT mint FROM stocks WHERE issuer = 'ondo' AND NOT excluded").fetch_all(db).await?;
     if mints.is_empty() { return Ok(0) }
     let jup = jupiter_prices(c, &mints).await;
     let now = chrono_now();
+    let p24 = prices_ago(db, now, 86400).await;
     for (mint, j) in &jup {
         let premium = j.underlying.filter(|m| *m > 0.0).map(|m| (j.usd / m - 1.0) * 100.0);
         sqlx::query("UPDATE stocks SET price_usd=$2, change_24h=$3, updated_at=$4, liquidity_usd=$5, mark_usd=$6, premium_pct=$7, mark_valuation=$8 WHERE mint=$1")
-            .bind(mint).bind(j.usd).bind(j.change_24h).bind(now).bind(j.liquidity).bind(j.underlying).bind(premium).bind(j.underlying_mcap).execute(db).await?;
+            .bind(mint).bind(j.usd).bind(pct(j.usd, p24.get(mint))).bind(now).bind(j.liquidity).bind(j.underlying).bind(premium).bind(j.underlying_mcap).execute(db).await?;
         sqlx::query("INSERT INTO stock_ticks (mint, ts, price_usd) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(mint).bind(now).bind(j.usd).execute(db).await?;
         if snapshot {
             sqlx::query("INSERT INTO stock_snapshots (mint, ts, price_usd, liquidity_usd, mark_usd, premium_pct, mark_valuation) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
