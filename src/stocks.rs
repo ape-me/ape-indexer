@@ -113,18 +113,25 @@ async fn backpack(c: &reqwest::Client) -> Vec<Asset> {
 // ── Ondo: their own feed sits behind a browser challenge, but every Ondo mint is on Jupiter's verified list
 // under one mint authority, with a PNG logo on Ondo's CDN. Trades go through Jupiter's RFQ, not pools. ──
 #[derive(Deserialize)]
-struct JupToken { id: String, name: String, symbol: String, icon: Option<String>, #[serde(rename = "mintAuthority")] mint_authority: Option<String> }
+struct JupToken {
+    id: String, name: String, symbol: String, icon: Option<String>,
+    #[serde(rename = "mintAuthority")] mint_authority: Option<String>,
+    mcap: Option<f64>, liquidity: Option<f64>, #[serde(default)] tags: Option<Vec<String>>,
+}
 
-async fn ondo(c: &reqwest::Client) -> Vec<Asset> {
-    let list: Vec<JupToken> = match c.get(JUP_VERIFIED).send().await.and_then(|r| r.error_for_status()) {
+async fn jup_verified(c: &reqwest::Client) -> Vec<JupToken> {
+    match c.get(JUP_VERIFIED).send().await.and_then(|r| r.error_for_status()) {
         Ok(r) => r.json().await.unwrap_or_default(),
-        Err(e) => { tracing::warn!(%e, "jupiter verified list"); return vec![] }
-    };
-    let out: Vec<Asset> = list.into_iter().filter(|t| t.mint_authority.as_deref() == Some(ONDO_MINT_AUTHORITY)).filter_map(|t| {
+        Err(e) => { tracing::warn!(%e, "jupiter verified list"); vec![] }
+    }
+}
+
+fn ondo(list: &[JupToken]) -> Vec<Asset> {
+    let out: Vec<Asset> = list.iter().filter(|t| t.mint_authority.as_deref() == Some(ONDO_MINT_AUTHORITY)).filter_map(|t| {
         let under = t.symbol.strip_suffix("on")?.to_string();
         let name = t.name.trim_end_matches(" (Ondo Tokenized)").to_string();
         let tags = if ONDO_247.contains(&under.as_str()) { vec!["247".to_string()] } else { vec![] };
-        Some(Asset { mint: t.id, category: stock_or_etf(&name, &under), symbol: t.symbol, name, issuer: "ondo", underlying: under, logo: t.icon, halted: false, tags })
+        Some(Asset { mint: t.id.clone(), category: stock_or_etf(&name, &under), symbol: t.symbol.clone(), name, issuer: "ondo", underlying: under, logo: t.icon.clone(), halted: false, tags })
     }).collect();
     tracing::info!(n = out.len(), "ondo assets");
     out
@@ -176,6 +183,45 @@ const SEEDS: [(&str, &str, &str, &str, &str, &str, &str); 31] = [
     ("A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6", "USDY", "Ondo US Dollar Yield", "earn", "earn", "USDY", "https://coin-images.coingecko.com/coins/images/31700/large/usdy_%281%29.png"),
 ];
 
+// ── Solana's own coins: Jupiter-verified, ranked by market cap. In at the top 50, out below 75, so the shelf does not
+// churn day to day. Stablecoins, staked SOL, yield and stock tokens, and anything already listed are left out. ──
+const TOP_COINS: usize = 50;
+const TOP_COINS_KEEP: usize = 75;
+const TOP_COIN_MIN_POOL_USD: f64 = 500_000.0;
+const NOT_COINS: [&str; 14] = ["stable", "lst", "yield", "yb", "rwa", "stocks", "xstocks", "ondo", "equities", "backpack", "prestocks", "jup-lend-earn", "duplicate", "commodities"];
+
+// A coin never takes a mint or symbol another coin has, nor is it a wrapped BTC/ETH/SOL. It may share a stock's ticker
+// (PUMP, MET) unless it is a memecoin, which is how the "GME" impersonators look.
+async fn top_coins(c: &reqwest::Client, list: &[JupToken], listed: &HashSet<String>, coins: &HashSet<String>, tickers: &HashSet<String>) -> Vec<Asset> {
+    let under = |t: &JupToken| t.symbol.trim_start_matches('$').to_uppercase();
+    let mut ranked: Vec<&JupToken> = list.iter().filter(|t| {
+        let tags = t.tags.as_deref().unwrap_or_default();
+        let u = under(t);
+        t.liquidity.unwrap_or(0.0) >= TOP_COIN_MIN_POOL_USD && t.mcap.unwrap_or(0.0) > 0.0
+            && !tags.iter().any(|g| NOT_COINS.contains(&g.as_str()))
+            && !u.contains("USD") && !u.contains("EUR")
+            && !(u.len() > 3 && ["BTC", "ETH", "SOL"].iter().any(|x| u.ends_with(x)))
+            && !coins.contains(&u) && !coins.contains(&t.id)
+            && !(tickers.contains(&u) && tags.iter().any(|g| g == "meme"))
+    }).collect();
+    ranked.sort_by(|a, b| b.mcap.unwrap_or(0.0).total_cmp(&a.mcap.unwrap_or(0.0)));
+    let picked: Vec<Asset> = ranked.into_iter().enumerate()
+        .filter(|(i, t)| *i < TOP_COINS || (*i < TOP_COINS_KEEP && listed.contains(&t.id)))
+        .map(|(_, t)| {
+            let tags = t.tags.as_deref().unwrap_or_default();
+            let group = if tags.iter().any(|g| g == "meme") { "memes" } else if tags.iter().any(|g| g == "defi") { "defi" } else { "solana" };
+            Asset { mint: t.id.clone(), symbol: t.symbol.clone(), name: t.name.clone(), issuer: "crypto", category: "crypto", underlying: under(t),
+                    logo: t.icon.clone(), halted: false, tags: vec![group.to_string(), "top".to_string()] }
+        }).collect();
+    // Jupiter serves some icons as SVG, which iOS cannot draw: those coins go without a logo.
+    let out: Vec<Asset> = futures::stream::iter(picked).map(|mut a| async move {
+        if let Some(u) = a.logo.take() { if is_bitmap(c, &u).await { a.logo = Some(u) } }
+        a
+    }).buffer_unordered(8).collect().await;
+    tracing::info!(n = out.len(), "top solana coins");
+    out
+}
+
 fn seeds() -> Vec<Asset> {
     SEEDS.iter().map(|&(mint, symbol, name, category, group, underlying, logo)| Asset {
         mint: mint.into(), symbol: symbol.into(), name: name.into(), issuer: if category == "earn" { "earn" } else { "crypto" },
@@ -203,10 +249,20 @@ pub async fn sync_list(db: &PgPool) -> Result<HashSet<String>> {
         .map(|mut a| async move { if liquid.contains(&a.mint) { a.logo = bitmap_logo(c, &a, backed_logos).await } a })
         .buffer_unordered(8).collect().await;
     assets.extend(checked);
-    let ondo = ondo(c).await;
+    let jup = jup_verified(c).await;
+    let ondo = ondo(&jup);
     if ondo.is_empty() { failed.push("ondo") }
     assets.extend(ondo);
     assets.extend(seeds());
+    let is_coin = |a: &&Asset| matches!(a.category, "crypto" | "earn");
+    let coins: HashSet<String> = assets.iter().map(|a| a.mint.clone())
+        .chain(assets.iter().filter(is_coin).map(|a| a.underlying.to_uppercase())).collect();
+    let tickers: HashSet<String> = assets.iter().filter(|a| !is_coin(a)).map(|a| a.underlying.to_uppercase()).collect();
+    let listed: HashSet<String> = sqlx::query_scalar("SELECT mint FROM stocks WHERE NOT excluded AND 'top' = ANY(tags)")
+        .fetch_all(db).await?.into_iter().collect();
+    let top = top_coins(c, &jup, &listed, &coins, &tickers).await;
+    if top.is_empty() { failed.push("crypto") }
+    assets.extend(top);
     if assets.len() < 500 { anyhow::bail!("catalog came back with {} assets; a source is down, keeping the table as is", assets.len()) }
     let now = chrono_now();
     let cfg: HashMap<String, (bool, Option<String>, Vec<String>)> = sqlx::query_as::<_, (String, bool, Option<String>, Vec<String>)>("SELECT mint, excluded, category, tags FROM stock_config")
